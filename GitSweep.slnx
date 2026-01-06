@@ -1,0 +1,7 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="GitSweep.Cli/GitSweep.Cli.csproj" />
+    <Project Path="GitSweep.Core/GitSweep.Core.csproj" />
+    <Project Path="GitSweep.Infrastructure/GitSweep.Infrastructure.csproj" />
+  </Folder>
+</Solution>
