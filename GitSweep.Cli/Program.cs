@@ -19,21 +19,35 @@ return await app.RunAsync(args);
 // Type declarations must come after top-level statements
 internal sealed class TypeRegistrar : ITypeRegistrar
 {
-    private readonly IServiceProvider _serviceProvider;
+    private readonly IServiceCollection _services;
 
     public TypeRegistrar()
     {
-        var services = new ServiceCollection();
-        services.AddSingleton<IGitRepositoryService, GitRepositoryService>();
-        services.AddSingleton<IBranchAnalyzer, BranchAnalyzer>();
-        _serviceProvider = services.BuildServiceProvider();
+        _services = new ServiceCollection();
+        _services.AddSingleton<IGitRepositoryService, GitRepositoryService>();
+        _services.AddSingleton<IBranchAnalyzer, BranchAnalyzer>();
     }
 
-    public ITypeResolver Build() => new TypeResolver(_serviceProvider);
+    public ITypeResolver Build()
+    {
+        var provider = _services.BuildServiceProvider();
+        return new TypeResolver(provider);
+    }
 
-    public void Register(Type service, Type implementation) { /* Not used in this simple setup */ }
-    void ITypeRegistrar.RegisterInstance(Type service, object implementation) { /* Not used */ }
-    void ITypeRegistrar.RegisterLazy(Type service, Func<object> func) { /* Not used */ }
+    public void Register(Type service, Type implementation)
+    {
+        _services.AddSingleton(service, implementation);
+    }
+
+    void ITypeRegistrar.RegisterInstance(Type service, object implementation)
+    {
+        _services.AddSingleton(service, implementation);
+    }
+
+    void ITypeRegistrar.RegisterLazy(Type service, Func<object> func)
+    {
+        _services.AddSingleton(service, _ => func());
+    }
 }
 
 internal sealed class TypeResolver : ITypeResolver
