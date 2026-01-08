@@ -31,27 +31,21 @@ public sealed class CleanCommand : AsyncCommand<CleanCommand.Settings>
 
     public override async Task<int> ExecuteAsync(CommandContext context, Settings settings, CancellationToken cancellationToken)
     {
-        // Forward to the existing implementation, ignoring the cancellationToken for now.
-        return await ExecuteAsync(context, settings);
-    }
-
-    public async Task<int> ExecuteAsync(CommandContext context, Settings settings)
-    {
         var repoPath = settings.Path ?? Environment.CurrentDirectory;
         var staleAge = settings.StaleAgeInMonths;
 
         // Validation
-        if (!await _gitService.IsGitRepositoryAsync(repoPath))
+        if (!await _gitService.IsGitRepositoryAsync(repoPath, cancellationToken))
         {
             AnsiConsole.MarkupLine("[red]Error:[/] The specified path is not a Git repository.");
             return 1;
         }
 
-        var defaultBranch = await _gitService.GetDefaultBranchNameAsync(repoPath);
+        var defaultBranch = await _gitService.GetDefaultBranchNameAsync(repoPath, cancellationToken);
         AnsiConsole.MarkupLine($"[green]Analyzing repository:[/] [blue]{repoPath}[/]");
         AnsiConsole.MarkupLine($"[green]Target branch:[/] [blue]{defaultBranch}[/]\n");
 
-        var allBranches = await _gitService.GetLocalBranchesAsync(repoPath, defaultBranch);
+        var allBranches = await _gitService.GetLocalBranchesAsync(repoPath, defaultBranch, cancellationToken);
         if (!allBranches.Any())
         {
             AnsiConsole.MarkupLine("[yellow]No local branches found to analyze.[/]");
@@ -105,7 +99,7 @@ public sealed class CleanCommand : AsyncCommand<CleanCommand.Settings>
         var deletedCount = 0;
         foreach (var branchName in selectedBranches)
         {
-            var deleteResult = await DeleteBranchAsync(repoPath, branchName);
+            var deleteResult = await DeleteBranchAsync(repoPath, branchName, cancellationToken);
             if (deleteResult)
             {
                 deletedCount++;
@@ -121,7 +115,7 @@ public sealed class CleanCommand : AsyncCommand<CleanCommand.Settings>
         return 0;
     }
 
-    private static async Task<bool> DeleteBranchAsync(string repoPath, string branchName)
+    private static async Task<bool> DeleteBranchAsync(string repoPath, string branchName, CancellationToken cancellationToken)
     {
         using var process = new Process
         {
@@ -138,7 +132,7 @@ public sealed class CleanCommand : AsyncCommand<CleanCommand.Settings>
         };
 
         process.Start();
-        await process.WaitForExitAsync();
+        await process.WaitForExitAsync(cancellationToken);
         return process.ExitCode == 0;
     }
 }
