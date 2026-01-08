@@ -5,7 +5,7 @@
 	<OutputType>Exe</OutputType>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
-    <AssemblyName>gitsweep</AssemblyName>
+    <AssemblyName>gitsweep-cli</AssemblyName>
   </PropertyGroup>
 
   <ItemGroup>
