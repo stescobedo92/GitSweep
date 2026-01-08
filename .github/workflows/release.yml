@@ -46,18 +46,22 @@ jobs:
             -p:PublishTrimmed=false \
             --self-contained true
 
-      - name: Archive artifact
+      - name: Archive artifact (Unix)
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           ARTIFACT_NAME="gitsweep-${{ github.ref_name }}-${{ matrix.rid }}"
           OUTDIR="GitSweep.Cli/bin/Release/net10.0/${{ matrix.rid }}/publish"
-          if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            pwsh -Command "Compress-Archive -Path $OUTDIR/gitsweep-cli${{ matrix.ext }} -DestinationPath $ARTIFACT_NAME.zip"
-          else
-            cd "$OUTDIR"
-            zip -r "${ARTIFACT_NAME}.zip" "gitsweep-cli${{ matrix.ext }}"
-            mv "${ARTIFACT_NAME}.zip" "$GITHUB_WORKSPACE"
-          fi
+          cd "$OUTDIR"
+          zip "${GITHUB_WORKSPACE}/${ARTIFACT_NAME}.zip" "gitsweep-cli"
+
+      - name: Archive artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ArtifactName = "gitsweep-${{ github.ref_name }}-${{ matrix.rid }}"
+          $OutDir = "GitSweep.Cli/bin/Release/net10.0/${{ matrix.rid }}/publish"
+          Compress-Archive -Path "$OutDir/gitsweep-cli.exe" -DestinationPath "$ArtifactName.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -81,6 +85,6 @@ jobs:
         with:
           tag_name: ${{ github.ref_name }}
           name: Release ${{ github.ref_name }}
-          files: artifacts/**/*
+          files: artifacts/**/*.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
