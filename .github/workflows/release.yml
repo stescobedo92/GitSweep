@@ -37,6 +37,7 @@ jobs:
         run: dotnet restore
 
       - name: Publish
+        shell: bash
         run: |
           dotnet publish GitSweep.Cli/GitSweep.Cli.csproj \
             -c Release \
