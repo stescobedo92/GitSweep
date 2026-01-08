@@ -43,8 +43,7 @@ jobs:
             -r ${{ matrix.rid }} \
             -p:PublishSingleFile=true \
             -p:PublishTrimmed=false \
-            --self-contained true \
-            -p:AssemblyName=gitsweep
+            --self-contained true
 
       - name: Archive artifact
         shell: bash
