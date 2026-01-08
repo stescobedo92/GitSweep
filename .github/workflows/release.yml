@@ -1,0 +1,86 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            rid: linux-x64
+            ext: ''
+          - os: windows-latest
+            rid: win-x64
+            ext: '.exe'
+          - os: macos-latest
+            rid: osx-x64
+            ext: ''
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restore
+        run: dotnet restore
+
+      - name: Publish
+        run: |
+          dotnet publish GitSweep.Cli/GitSweep.Cli.csproj \
+            -c Release \
+            -r ${{ matrix.rid }} \
+            -p:PublishSingleFile=true \
+            -p:PublishTrimmed=false \
+            --self-contained true \
+            -p:AssemblyName=gitsweep
+
+      - name: Archive artifact
+        shell: bash
+        run: |
+          ARTIFACT_NAME="gitsweep-${{ github.ref_name }}-${{ matrix.rid }}"
+          OUTDIR="GitSweep.Cli/bin/Release/net10.0/${{ matrix.rid }}/publish"
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            pwsh -Command "Compress-Archive -Path $OUTDIR/gitsweep${{ matrix.ext }} -DestinationPath $ARTIFACT_NAME.zip"
+          else
+            cd "$OUTDIR"
+            zip -r "${ARTIFACT_NAME}.zip" "gitsweep${{ matrix.ext }}"
+            mv "${ARTIFACT_NAME}.zip" "$GITHUB_WORKSPACE"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitsweep-${{ github.ref_name }}-${{ matrix.rid }}
+          path: gitsweep-${{ github.ref_name }}-${{ matrix.rid }}.zip
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
+          files: artifacts/**/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
