@@ -4,4 +4,8 @@
     <Project Path="GitSweep.Core/GitSweep.Core.csproj" />
     <Project Path="GitSweep.Infrastructure/GitSweep.Infrastructure.csproj" />
   </Folder>
+  <Folder Name="/tests/">
+    <Project Path="GitSweep.Core.Tests/GitSweep.Core.Tests.csproj" />
+    <Project Path="GitSweep.Infrastructure.Tests/GitSweep.Infrastructure.Tests.csproj" />
+  </Folder>
 </Solution>
