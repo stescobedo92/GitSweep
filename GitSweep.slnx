@@ -5,6 +5,7 @@
     <Project Path="GitSweep.Infrastructure/GitSweep.Infrastructure.csproj" />
   </Folder>
   <Folder Name="/tests/">
+    <Project Path="GitSweep.Cli.Tests/GitSweep.Cli.Tests.csproj" />
     <Project Path="GitSweep.Core.Tests/GitSweep.Core.Tests.csproj" />
     <Project Path="GitSweep.Infrastructure.Tests/GitSweep.Infrastructure.Tests.csproj" />
   </Folder>

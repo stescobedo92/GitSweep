@@ -2,6 +2,7 @@
 using GitSweep.Core.Services;
 using GitSweep.Infrastructure.Services;
 using Microsoft.Extensions.DependencyInjection;
+using Spectre.Console;
 using Spectre.Console.Cli;
 
 var app = new CommandApp(new TypeRegistrar());
@@ -26,6 +27,7 @@ internal sealed class TypeRegistrar : ITypeRegistrar
         _services = new ServiceCollection();
         _services.AddSingleton<IGitRepositoryService, GitRepositoryService>();
         _services.AddSingleton<IBranchAnalyzer, BranchAnalyzer>();
+        _services.AddSingleton<IAnsiConsole>(AnsiConsole.Console);
     }
 
     public ITypeResolver Build()
