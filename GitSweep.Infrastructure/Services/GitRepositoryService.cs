@@ -66,7 +66,7 @@ public class GitRepositoryService : IGitRepositoryService
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
     }
 
-    private static async Task<(int ExitCode, string Output)> ExecuteGitCommandAsync(string workingDirectory, string[] arguments, CancellationToken ct)
+    private static async Task<(int ExitCode, string Output, string Error)> ExecuteGitCommandAsync(string workingDirectory, string[] arguments, CancellationToken ct)
     {
         using var process = new Process
         {
@@ -83,9 +83,12 @@ public class GitRepositoryService : IGitRepositoryService
         };
 
         process.Start();
-        var output = await process.StandardOutput.ReadToEndAsync(ct);
+        var outputTask = process.StandardOutput.ReadToEndAsync(ct);
+        var errorTask = process.StandardError.ReadToEndAsync(ct);
         await process.WaitForExitAsync(ct);
+        var output = await outputTask;
+        var error = await errorTask;
 
-        return (process.ExitCode, output);
+        return (process.ExitCode, output, error);
     }
 }

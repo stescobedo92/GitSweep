@@ -35,9 +35,15 @@ public sealed class CleanCommand : AsyncCommand<CleanCommand.Settings>
         var staleAge = settings.StaleAgeInMonths;
 
         // Validation
+        if (staleAge < 0)
+        {
+            AnsiConsole.MarkupLine("[red]Error:[/] The stale age ([blue]--age[/]) must be a non-negative number.");
+            return 1;
+        }
+
         if (!await _gitService.IsGitRepositoryAsync(repoPath, cancellationToken))
         {
-            AnsiConsole.MarkupLine("[red]Error:[/] The specified path is not a Git repository.");
+            AnsiConsole.MarkupLine($"[red]Error:[/] '[blue]{Markup.Escape(repoPath)}[/]' is not a Git repository. Ensure the path is correct and contains a [blue].git[/] directory.");
             return 1;
         }
 
@@ -99,15 +105,22 @@ public sealed class CleanCommand : AsyncCommand<CleanCommand.Settings>
         var deletedCount = 0;
         foreach (var branchName in selectedBranches)
         {
-            var deleteResult = await DeleteBranchAsync(repoPath, branchName, cancellationToken);
-            if (deleteResult)
+            var (success, errorMessage) = await DeleteBranchAsync(repoPath, branchName, cancellationToken);
+            if (success)
             {
                 deletedCount++;
-                AnsiConsole.MarkupLine($"[green]Deleted branch:[/] [blue]{branchName}[/]");
+                AnsiConsole.MarkupLine($"[green]Deleted branch:[/] [blue]{Markup.Escape(branchName)}[/]");
             }
             else
             {
-                AnsiConsole.MarkupLine($"[red]Failed to delete branch:[/] [blue]{branchName}[/]");
+                var reason = string.IsNullOrWhiteSpace(errorMessage)
+                    ? "unknown error"
+                    : errorMessage.Trim();
+                AnsiConsole.MarkupLine($"[red]Failed to delete branch '[blue]{Markup.Escape(branchName)}[/]':[/] {Markup.Escape(reason)}");
+                if (reason.Contains("not fully merged", StringComparison.OrdinalIgnoreCase))
+                {
+                    AnsiConsole.MarkupLine($"  [grey]Tip: Use [blue]git branch -D {Markup.Escape(branchName)}[/] to force-delete this branch if you no longer need its changes.[/]");
+                }
             }
         }
 
@@ -115,7 +128,7 @@ public sealed class CleanCommand : AsyncCommand<CleanCommand.Settings>
         return 0;
     }
 
-    private static async Task<bool> DeleteBranchAsync(string repoPath, string branchName, CancellationToken cancellationToken)
+    private static async Task<(bool Success, string ErrorMessage)> DeleteBranchAsync(string repoPath, string branchName, CancellationToken cancellationToken)
     {
         using var process = new Process
         {
@@ -132,7 +145,11 @@ public sealed class CleanCommand : AsyncCommand<CleanCommand.Settings>
         };
 
         process.Start();
+        var outputTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
+        var errorTask = process.StandardError.ReadToEndAsync(cancellationToken);
         await process.WaitForExitAsync(cancellationToken);
-        return process.ExitCode == 0;
+        await outputTask;
+        var errorMessage = await errorTask;
+        return (process.ExitCode == 0, errorMessage);
     }
 }
