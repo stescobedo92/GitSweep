@@ -22,11 +22,13 @@ public sealed class CleanCommand : AsyncCommand<CleanCommand.Settings>
 
     private readonly IGitRepositoryService _gitService;
     private readonly IBranchAnalyzer _analyzer;
+    private readonly IAnsiConsole _console;
 
-    public CleanCommand(IGitRepositoryService gitService, IBranchAnalyzer analyzer)
+    public CleanCommand(IGitRepositoryService gitService, IBranchAnalyzer analyzer, IAnsiConsole console)
     {
         _gitService = gitService;
         _analyzer = analyzer;
+        _console = console;
     }
 
     public override async Task<int> ExecuteAsync(CommandContext context, Settings settings, CancellationToken cancellationToken)
@@ -37,24 +39,24 @@ public sealed class CleanCommand : AsyncCommand<CleanCommand.Settings>
         // Validation
         if (staleAge < 0)
         {
-            AnsiConsole.MarkupLine("[red]Error:[/] The stale age ([blue]--age[/]) must be a non-negative number.");
+            _console.MarkupLine("[red]Error:[/] The stale age ([blue]--age[/]) must be a non-negative number.");
             return 1;
         }
 
         if (!await _gitService.IsGitRepositoryAsync(repoPath, cancellationToken))
         {
-            AnsiConsole.MarkupLine($"[red]Error:[/] '[blue]{Markup.Escape(repoPath)}[/]' is not a Git repository. Ensure the path is correct and contains a [blue].git[/] directory.");
+            _console.MarkupLine($"[red]Error:[/] '[blue]{Markup.Escape(repoPath)}[/]' is not a Git repository. Ensure the path is correct and contains a [blue].git[/] directory.");
             return 1;
         }
 
         var defaultBranch = await _gitService.GetDefaultBranchNameAsync(repoPath, cancellationToken);
-        AnsiConsole.MarkupLine($"[green]Analyzing repository:[/] [blue]{repoPath}[/]");
-        AnsiConsole.MarkupLine($"[green]Target branch:[/] [blue]{defaultBranch}[/]\n");
+        _console.MarkupLine($"[green]Analyzing repository:[/] [blue]{repoPath}[/]");
+        _console.MarkupLine($"[green]Target branch:[/] [blue]{defaultBranch}[/]\n");
 
         var allBranches = await _gitService.GetLocalBranchesAsync(repoPath, defaultBranch, cancellationToken);
         if (!allBranches.Any())
         {
-            AnsiConsole.MarkupLine("[yellow]No local branches found to analyze.[/]");
+            _console.MarkupLine("[yellow]No local branches found to analyze.[/]");
             return 0;
         }
 
@@ -66,7 +68,7 @@ public sealed class CleanCommand : AsyncCommand<CleanCommand.Settings>
 
         if (!allCandidateBranches.Any())
         {
-            AnsiConsole.MarkupLine("[green]No stale or merged branches found. Your repository is clean![/]");
+            _console.MarkupLine("[green]No stale or merged branches found. Your repository is clean![/]");
             return 0;
         }
 
@@ -81,7 +83,7 @@ public sealed class CleanCommand : AsyncCommand<CleanCommand.Settings>
             })
             .ToList();
 
-        var selectedBranches = AnsiConsole.Prompt(
+        var selectedBranches = _console.Prompt(
             new MultiSelectionPrompt<string>()
                 .Title("Select branches to delete")
                 .NotRequired()
@@ -90,15 +92,15 @@ public sealed class CleanCommand : AsyncCommand<CleanCommand.Settings>
 
         if (!selectedBranches.Any())
         {
-            AnsiConsole.MarkupLine("[yellow]No branches selected for deletion.[/]");
+            _console.MarkupLine("[yellow]No branches selected for deletion.[/]");
             return 0;
         }
 
         // Confirmation and Deletion
-        AnsiConsole.MarkupLine($"\n[red]You are about to delete {selectedBranches.Count} branch(es). This action is irreversible.[/]");
-        if (!AnsiConsole.Confirm("Are you sure you want to continue?"))
+        _console.MarkupLine($"\n[red]You are about to delete {selectedBranches.Count} branch(es). This action is irreversible.[/]");
+        if (!_console.Confirm("Are you sure you want to continue?"))
         {
-            AnsiConsole.MarkupLine("[yellow]Operation cancelled.[/]");
+            _console.MarkupLine("[yellow]Operation cancelled.[/]");
             return 0;
         }
 
@@ -109,22 +111,22 @@ public sealed class CleanCommand : AsyncCommand<CleanCommand.Settings>
             if (success)
             {
                 deletedCount++;
-                AnsiConsole.MarkupLine($"[green]Deleted branch:[/] [blue]{Markup.Escape(branchName)}[/]");
+                _console.MarkupLine($"[green]Deleted branch:[/] [blue]{Markup.Escape(branchName)}[/]");
             }
             else
             {
                 var reason = string.IsNullOrWhiteSpace(errorMessage)
                     ? "unknown error"
                     : errorMessage.Trim();
-                AnsiConsole.MarkupLine($"[red]Failed to delete branch '[blue]{Markup.Escape(branchName)}[/]':[/] {Markup.Escape(reason)}");
+                _console.MarkupLine($"[red]Failed to delete branch '[blue]{Markup.Escape(branchName)}[/]':[/] {Markup.Escape(reason)}");
                 if (reason.Contains("not fully merged", StringComparison.OrdinalIgnoreCase))
                 {
-                    AnsiConsole.MarkupLine($"  [grey]Tip: Use [blue]git branch -D {Markup.Escape(branchName)}[/] to force-delete this branch if you no longer need its changes.[/]");
+                    _console.MarkupLine($"  [grey]Tip: Use [blue]git branch -D {Markup.Escape(branchName)}[/] to force-delete this branch if you no longer need its changes.[/]");
                 }
             }
         }
 
-        AnsiConsole.MarkupLine($"\n[green]Operation completed. {deletedCount} branch(es) deleted.[/]");
+        _console.MarkupLine($"\n[green]Operation completed. {deletedCount} branch(es) deleted.[/]");
         return 0;
     }
 
