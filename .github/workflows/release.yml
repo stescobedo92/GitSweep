@@ -191,7 +191,7 @@ jobs:
             exit 1
           fi
 
-          npm publish npm-artifacts/*.tgz --access public --registry https://registry.npmjs.org
+          npm publish ./npm-artifacts/*.tgz --access public --registry https://registry.npmjs.org
 
   create-github-release:
     needs:
