@@ -43,10 +43,23 @@ public sealed class CleanCommandTests
         var command = CreateCommand(console);
         var settings = new CleanCommand.Settings { StaleAgeInMonths = -1 };
 
-        var result = await command.ExecuteAsync(CreateContext(), settings, CancellationToken.None);
+        var result = await command.ExecuteForTestAsync(CreateContext(), settings, CancellationToken.None);
 
         Assert.Equal(1, result);
         Assert.Contains("must be a non-negative number", console.Output);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_returns_1_when_yes_is_used_without_all()
+    {
+        var console = new TestConsole();
+        var command = CreateCommand(console);
+        var settings = new CleanCommand.Settings { ConfirmDeletion = true };
+
+        var result = await command.ExecuteForTestAsync(CreateContext(), settings, CancellationToken.None);
+
+        Assert.Equal(1, result);
+        Assert.Contains("--yes option must be used with --all", console.Output);
     }
 
     [Fact]
@@ -59,7 +72,7 @@ public sealed class CleanCommandTests
         _gitService.IsGitRepositoryAsync("/not/a/repo", Arg.Any<CancellationToken>())
             .Returns(false);
 
-        var result = await command.ExecuteAsync(CreateContext(), settings, CancellationToken.None);
+        var result = await command.ExecuteForTestAsync(CreateContext(), settings, CancellationToken.None);
 
         Assert.Equal(1, result);
         Assert.Contains("is not a Git repository", console.Output);
@@ -79,7 +92,7 @@ public sealed class CleanCommandTests
         _gitService.GetLocalBranchesAsync("/some/repo", "main", Arg.Any<CancellationToken>())
             .Returns([]);
 
-        var result = await command.ExecuteAsync(CreateContext(), settings, CancellationToken.None);
+        var result = await command.ExecuteForTestAsync(CreateContext(), settings, CancellationToken.None);
 
         Assert.Equal(0, result);
         Assert.Contains("No local branches found to analyze", console.Output);
@@ -102,7 +115,7 @@ public sealed class CleanCommandTests
         _analyzer.IdentifyStaleBranches(branches, 6).Returns([]);
         _analyzer.IdentifyMergedBranches(branches).Returns([]);
 
-        var result = await command.ExecuteAsync(CreateContext(), settings, CancellationToken.None);
+        var result = await command.ExecuteForTestAsync(CreateContext(), settings, CancellationToken.None);
 
         Assert.Equal(0, result);
         Assert.Contains("No stale or merged branches found", console.Output);
@@ -130,7 +143,7 @@ public sealed class CleanCommandTests
         _analyzer.IdentifyStaleBranches(branches, 6).Returns(staleBranches);
         _analyzer.IdentifyMergedBranches(branches).Returns([]);
 
-        var result = await command.ExecuteAsync(CreateContext(), settings, CancellationToken.None);
+        var result = await command.ExecuteForTestAsync(CreateContext(), settings, CancellationToken.None);
 
         Assert.Equal(0, result);
         Assert.Contains("No branches selected for deletion", console.Output);
@@ -161,7 +174,7 @@ public sealed class CleanCommandTests
         _analyzer.IdentifyStaleBranches(branches, 6).Returns(staleBranches);
         _analyzer.IdentifyMergedBranches(branches).Returns([]);
 
-        var result = await command.ExecuteAsync(CreateContext(), settings, CancellationToken.None);
+        var result = await command.ExecuteForTestAsync(CreateContext(), settings, CancellationToken.None);
 
         Assert.Equal(0, result);
         Assert.Contains("Operation cancelled", console.Output);
@@ -177,7 +190,7 @@ public sealed class CleanCommandTests
         _gitService.IsGitRepositoryAsync(Environment.CurrentDirectory, Arg.Any<CancellationToken>())
             .Returns(false);
 
-        await command.ExecuteAsync(CreateContext(), settings, CancellationToken.None);
+        await command.ExecuteForTestAsync(CreateContext(), settings, CancellationToken.None);
 
         await _gitService.Received(1)
             .IsGitRepositoryAsync(Environment.CurrentDirectory, Arg.Any<CancellationToken>());
@@ -207,10 +220,37 @@ public sealed class CleanCommandTests
         _analyzer.IdentifyStaleBranches(branches, 6).Returns([stale]);
         _analyzer.IdentifyMergedBranches(branches).Returns([merged]);
 
-        var result = await command.ExecuteAsync(CreateContext(), settings, CancellationToken.None);
+        var result = await command.ExecuteForTestAsync(CreateContext(), settings, CancellationToken.None);
 
         Assert.Equal(0, result);
         // Both branches appear as choices, user picks none → "No branches selected"
         Assert.Contains("No branches selected for deletion", console.Output);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_dry_run_does_not_delete_candidates()
+    {
+        var console = new TestConsole();
+        var command = CreateCommand(console);
+        var settings = new CleanCommand.Settings { Path = "/some/repo", DryRun = true };
+
+        var merged = new BranchInfo("feature/merged", DateTime.UtcNow, true);
+        var branches = new List<BranchInfo> { merged };
+
+        _gitService.IsGitRepositoryAsync("/some/repo", Arg.Any<CancellationToken>())
+            .Returns(true);
+        _gitService.GetDefaultBranchNameAsync("/some/repo", Arg.Any<CancellationToken>())
+            .Returns("main");
+        _gitService.GetLocalBranchesAsync("/some/repo", "main", Arg.Any<CancellationToken>())
+            .Returns(branches);
+        _analyzer.IdentifyStaleBranches(branches, 6).Returns([]);
+        _analyzer.IdentifyMergedBranches(branches).Returns([merged]);
+
+        var result = await command.ExecuteForTestAsync(CreateContext(), settings, CancellationToken.None);
+
+        Assert.Equal(0, result);
+        Assert.Contains("Dry run enabled", console.Output);
+        await _gitService.DidNotReceive()
+            .DeleteBranchAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<CancellationToken>());
     }
 }

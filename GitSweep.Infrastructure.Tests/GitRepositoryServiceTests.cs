@@ -77,6 +77,16 @@ public sealed class GitRepositoryServiceTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task IsGitRepositoryAsync_returns_false_for_missing_path()
+    {
+        var path = Path.Combine(Path.GetTempPath(), "GitSweepTests", Guid.NewGuid().ToString("N"));
+
+        var result = await _sut.IsGitRepositoryAsync(path);
+
+        Assert.False(result);
+    }
+
+    [Fact]
     public async Task GetDefaultBranchNameAsync_returns_main()
     {
         var result = await _sut.GetDefaultBranchNameAsync(_repoPath);
@@ -98,6 +108,17 @@ public sealed class GitRepositoryServiceTests : IAsyncLifetime
         Assert.DoesNotContain(branches, b => string.Equals(b.Name, "main", StringComparison.OrdinalIgnoreCase));
     }
 
+    [Fact]
+    public async Task DeleteBranchAsync_deletes_merged_branch()
+    {
+        var result = await _sut.DeleteBranchAsync(_repoPath, "feature/merged");
+
+        Assert.True(result.Success, result.ErrorMessage);
+
+        var branches = await _sut.GetLocalBranchesAsync(_repoPath, "main");
+        Assert.DoesNotContain(branches, b => string.Equals(b.Name, "feature/merged", StringComparison.OrdinalIgnoreCase));
+    }
+
     private async Task InitRepositoryAsync()
     {
         try
@@ -111,12 +132,10 @@ public sealed class GitRepositoryServiceTests : IAsyncLifetime
         }
     }
 
-    private Task ConfigureUserAsync()
+    private async Task ConfigureUserAsync()
     {
-        return Task.WhenAll(
-            RunGitAsync("config user.email tests@example.com"),
-            RunGitAsync("config user.name GitSweep Tests")
-        );
+        await RunGitAsync("config user.email tests@example.com");
+        await RunGitAsync("config user.name GitSweep Tests");
     }
 
     private async Task RunGitAsync(string arguments)

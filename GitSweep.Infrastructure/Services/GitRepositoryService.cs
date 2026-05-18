@@ -8,6 +8,11 @@ public class GitRepositoryService : IGitRepositoryService
 {
     public async Task<bool> IsGitRepositoryAsync(string path, CancellationToken ct = default)
     {
+        if (!Directory.Exists(path))
+        {
+            return false;
+        }
+
         var result = await ExecuteGitCommandAsync(path, ["rev-parse", "--git-dir"], ct);
         return result.ExitCode == 0;
     }
@@ -58,6 +63,12 @@ public class GitRepositoryService : IGitRepositoryService
         return branches;
     }
 
+    public async Task<(bool Success, string ErrorMessage)> DeleteBranchAsync(string path, string branchName, CancellationToken ct = default)
+    {
+        var result = await ExecuteGitCommandAsync(path, ["branch", "-d", branchName], ct);
+        return (result.ExitCode == 0, string.IsNullOrWhiteSpace(result.Error) ? result.Output : result.Error);
+    }
+
     private static HashSet<string> ParseBranchList(string output)
     {
         return output
@@ -73,7 +84,6 @@ public class GitRepositoryService : IGitRepositoryService
             StartInfo = new ProcessStartInfo
             {
                 FileName = "git",
-                Arguments = string.Join(" ", arguments),
                 WorkingDirectory = workingDirectory,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
@@ -81,6 +91,11 @@ public class GitRepositoryService : IGitRepositoryService
                 CreateNoWindow = true
             }
         };
+
+        foreach (var argument in arguments)
+        {
+            process.StartInfo.ArgumentList.Add(argument);
+        }
 
         process.Start();
         var outputTask = process.StandardOutput.ReadToEndAsync(ct);
