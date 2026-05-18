@@ -285,6 +285,14 @@ FakesAssemblies/
 .ntvs_analysis.dat
 node_modules/
 
+# npm package build output
+npm-artifacts/
+npm-package/assets/
+npm-package/LICENSE.txt
+npm-package/tools/
+!npm-package/bin/
+!npm-package/bin/gitsweep.js
+
 # Visual Studio 6 build log
 *.plg
 

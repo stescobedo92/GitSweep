@@ -1,0 +1,36 @@
+{
+  "name": "@stescobedo9205/gitsweep-cli",
+  "version": "0.0.0",
+  "description": "Interactive CLI for finding and cleaning stale or merged local Git branches.",
+  "license": "GPL-3.0-only",
+  "author": "stescobedo9205",
+  "homepage": "https://github.com/stescobedo92/GitSweep#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/stescobedo92/GitSweep.git"
+  },
+  "bugs": {
+    "url": "https://github.com/stescobedo92/GitSweep/issues"
+  },
+  "keywords": [
+    "git",
+    "cli",
+    "dotnet",
+    "spectre-console",
+    "branch-cleanup",
+    "tui"
+  ],
+  "bin": {
+    "gitsweep": "bin/gitsweep.js"
+  },
+  "files": [
+    "bin/",
+    "tools/",
+    "assets/",
+    "README.md",
+    "LICENSE.txt"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}

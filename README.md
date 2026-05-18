@@ -21,10 +21,17 @@ GitSweep is an interactive .NET CLI for finding and cleaning local Git branches 
 dotnet tool install --global GitSweep.Cli
 ```
 
+Or install the npm wrapper:
+
+```bash
+npm install --global @stescobedo9205/gitsweep-cli
+```
+
 Update an existing install:
 
 ```bash
 dotnet tool update --global GitSweep.Cli
+npm update --global @stescobedo9205/gitsweep-cli
 ```
 
 ## Quick Start
@@ -107,4 +114,4 @@ Releases are automated with Release Please and Conventional Commits:
 - `feat:` creates a minor release.
 - `feat!:` or `BREAKING CHANGE:` creates a major release.
 
-When the generated Release PR is merged, GitHub Actions creates the SemVer tag/release, packs `GitSweep.Cli` as a .NET tool, publishes it to nuget.org with the `NUGET_ORG_NEW_API_KEY` secret, and attaches the `.nupkg` to the GitHub release.
+When changes land on `master`, GitHub Actions calculates the next SemVer, packs `GitSweep.Cli` as a .NET tool, publishes it to nuget.org, publishes `@stescobedo9205/gitsweep-cli` to npm, and creates the GitHub release. The workflow currently uses the `NUGET_ORG_NEW_API_KEY` secret for both registry publishes.
