@@ -182,12 +182,12 @@ jobs:
       - name: Publish to npm
         shell: bash
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NUGET_ORG_NEW_API_KEY }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_ORG }}
         run: |
           set -euo pipefail
 
           if [ -z "${NODE_AUTH_TOKEN}" ]; then
-            echo "::error::NUGET_ORG_NEW_API_KEY is not configured."
+            echo "::error::NPM_ORG is not configured."
             exit 1
           fi
 
