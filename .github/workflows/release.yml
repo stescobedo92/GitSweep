@@ -8,34 +8,93 @@ on:
 
 permissions:
   contents: write
-  pull-requests: write
-  issues: write
 
 jobs:
-  release-please:
+  prepare-release:
     runs-on: ubuntu-latest
     outputs:
-      release_created: ${{ steps.release.outputs.release_created }}
-      tag_name: ${{ steps.release.outputs.tag_name }}
-      version: ${{ steps.release.outputs.version }}
+      release_created: ${{ steps.version.outputs.release_created }}
+      tag_name: ${{ steps.version.outputs.tag_name }}
+      version: ${{ steps.version.outputs.version }}
 
     steps:
-      - name: Create or update release PR
-        id: release
-        uses: googleapis/release-please-action@v4
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
-          release-type: simple
-          package-name: GitSweep.Cli
-          include-v-in-tag: true
+          fetch-depth: 0
+
+      - name: Calculate next SemVer
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          latest_tag="$(git tag --list 'v[0-9]*' --sort=-v:refname | head -n 1)"
+          if [ -z "${latest_tag}" ]; then
+            base_version="0.0.0"
+            commit_range="HEAD"
+          else
+            base_version="${latest_tag#v}"
+            commit_range="${latest_tag}..HEAD"
+          fi
+
+          commit_count="$(git rev-list --count "${commit_range}")"
+          if [ "${commit_count}" -eq 0 ]; then
+            echo "release_created=false" >> "${GITHUB_OUTPUT}"
+            echo "tag_name=${latest_tag}" >> "${GITHUB_OUTPUT}"
+            echo "version=${base_version}" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          IFS='.' read -r major minor patch <<< "${base_version}"
+          commit_text="$(git log --format='%s%n%b' "${commit_range}")"
+
+          bump="patch"
+          if echo "${commit_text}" | grep -Eq '(^|[[:space:]])BREAKING CHANGE:|^[a-zA-Z]+(\([^)]+\))?!:'; then
+            bump="major"
+          elif echo "${commit_text}" | grep -Eq '^feat(\([^)]+\))?:'; then
+            bump="minor"
+          fi
+
+          case "${bump}" in
+            major)
+              major=$((major + 1))
+              minor=0
+              patch=0
+              ;;
+            minor)
+              minor=$((minor + 1))
+              patch=0
+              ;;
+            patch)
+              patch=$((patch + 1))
+              ;;
+          esac
+
+          version="${major}.${minor}.${patch}"
+          tag_name="v${version}"
+
+          if git rev-parse -q --verify "refs/tags/${tag_name}" >/dev/null 2>&1; then
+            echo "release_created=false" >> "${GITHUB_OUTPUT}"
+            echo "tag_name=${tag_name}" >> "${GITHUB_OUTPUT}"
+            echo "version=${version}" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          echo "release_created=true" >> "${GITHUB_OUTPUT}"
+          echo "tag_name=${tag_name}" >> "${GITHUB_OUTPUT}"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
 
   publish-nuget:
-    needs: release-please
-    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    needs: prepare-release
+    if: ${{ needs.prepare-release.outputs.release_created == 'true' }}
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
@@ -49,13 +108,15 @@ jobs:
         run: dotnet test --configuration Release --no-restore --verbosity normal
 
       - name: Pack NuGet tool
-        run: dotnet pack GitSweep.Cli/GitSweep.Cli.csproj --configuration Release --no-restore --output artifacts -p:Version=${{ needs.release-please.outputs.version }} -p:PackageVersion=${{ needs.release-please.outputs.version }}
+        run: dotnet pack GitSweep.Cli/GitSweep.Cli.csproj --configuration Release --no-restore --output artifacts -p:Version=${{ needs.prepare-release.outputs.version }} -p:PackageVersion=${{ needs.prepare-release.outputs.version }}
 
       - name: Publish to nuget.org
         shell: bash
         env:
           NUGET_API_KEY: ${{ secrets.NUGET_ORG_NEW_API_KEY }}
         run: |
+          set -euo pipefail
+
           if [ -z "${NUGET_API_KEY}" ]; then
             echo "::error::NUGET_ORG_NEW_API_KEY is not configured."
             exit 1
@@ -68,8 +129,23 @@ jobs:
               --skip-duplicate
           done
 
-      - name: Attach package to GitHub release
+      - name: Create GitHub release
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG_NAME: ${{ needs.release-please.outputs.tag_name }}
-        run: gh release upload "${TAG_NAME}" artifacts/*.nupkg --clobber
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ needs.prepare-release.outputs.tag_name }}
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          previous_tag="$(git tag --list 'v[0-9]*' --sort=-v:refname | grep -v "^${TAG_NAME}$" | head -n 1 || true)"
+          if [ -z "${previous_tag}" ]; then
+            git log --no-merges --format='- %s (%h)' HEAD > release-notes.md
+          else
+            git log --no-merges --format='- %s (%h)' "${previous_tag}..HEAD" > release-notes.md
+          fi
+
+          gh release create "${TAG_NAME}" artifacts/*.nupkg \
+            --target "${GITHUB_SHA}" \
+            --title "GitSweep ${VERSION}" \
+            --notes-file release-notes.md
