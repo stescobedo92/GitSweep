@@ -1,4 +1,4 @@
-﻿using GitSweep.Core.Models;
+using GitSweep.Core.Models;
 using GitSweep.Core.Services;
 
 namespace GitSweep.Infrastructure.Services;
@@ -9,7 +9,7 @@ namespace GitSweep.Infrastructure.Services;
 public class BranchAnalyzer : IBranchAnalyzer
 {
     /// <summary>
-    /// Identifies branches that have been merged.
+    /// Identifies branches that have been merged, including squash/rebase merges.
     /// </summary>
     /// <param name="branches">The collection of branches to analyze.</param>
     /// <returns>An enumerable of merged branches.</returns>
@@ -18,7 +18,23 @@ public class BranchAnalyzer : IBranchAnalyzer
         if (branches is null)
             throw new ArgumentNullException(nameof(branches));
 
-        return branches.Where(b => b.IsMerged);
+        return branches.Where(b => b.IsEffectivelyMerged);
+    }
+
+    public IEnumerable<BranchInfo> IdentifyGoneBranches(IReadOnlyList<BranchInfo> branches)
+    {
+        if (branches is null)
+            throw new ArgumentNullException(nameof(branches));
+
+        return branches.Where(b => b.IsUpstreamGone);
+    }
+
+    public IEnumerable<BranchInfo> IdentifySafeGoneBranches(IReadOnlyList<BranchInfo> branches)
+    {
+        if (branches is null)
+            throw new ArgumentNullException(nameof(branches));
+
+        return branches.Where(b => b.IsSafeGoneCandidate);
     }
 
     /// <summary>
@@ -42,7 +58,7 @@ public class BranchAnalyzer : IBranchAnalyzer
         return branches.Where(b =>
             b.LastCommitDate.HasValue &&
             b.LastCommitDate.Value < cutoffDate &&
-            !b.IsMerged
+            !b.IsEffectivelyMerged
         );
     }
 }
