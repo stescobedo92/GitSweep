@@ -65,6 +65,13 @@ gitsweep clean --merged-only --all --yes
 # Preview what an automation run would delete.
 gitsweep clean --stale-only --age 6 --all --dry-run
 
+# Undo the most recent clean run (restores its whole deletion batch).
+gitsweep undo
+
+# List trashed branches and restore one (or all) at its saved SHA.
+gitsweep restore --branch feature/login
+gitsweep restore --all --yes
+
 # Use a relative path and default stale age.
 gitsweep clean -p ../other-repo
 ```
@@ -88,8 +95,11 @@ gitsweep clean -p ../other-repo
 - `GitSweep.Infrastructure` runs Git commands and keeps command-line process details out of the UI layer.
 - Merged branches are detected with `git branch --merged <target>`.
 - Stale branches are branches whose last commit is older than the configured age and are not already classified as merged.
+- Every candidate also gets a risk traffic light (semáforo) in a Spectre table: **segura** only when the branch is really merged into the target (ancestor or squash/rebase) with no unique commits left; **peligrosa** when it has unique commits that are not merged and not fully pushed (no upstream, or commits ahead of its upstream); **revisar** for everything else, including unknown data — GitSweep never marks a branch segura when a count could not be measured. Unique commits are counted by patch equivalence (`git cherry`) against the target, and unpushed commits against the branch upstream.
 
 GitSweep deletes branches with safe local deletes (`git branch -d`). If Git refuses because a branch is not fully merged, GitSweep reports the failure and leaves the branch intact.
+
+Before any deletion, GitSweep captures the branch tip SHA and stores it as a JSON file under `.git/gitsweep/trash` (one GUID-named file per branch, grouped by a per-run batch id). If the SHA cannot be captured or the trash entry cannot be written, the branch is not deleted. `gitsweep undo` restores every branch from the most recent batch, and `gitsweep restore` lists the trash and recreates a chosen branch (or `--all`) at exactly its saved SHA with plain `git branch` — existing branches are never overwritten, and a trash entry is removed only after its branch exists again.
 
 ## Development
 
