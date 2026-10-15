@@ -143,6 +143,14 @@ public class GitRepositoryService : IGitRepositoryService
 
         var branches = new List<BranchInfo>();
 
+        // Nunca candidatas: la rama actual ni las que están en worktrees
+        // (git rechazaría borrarlas, pero excluirlas aquí evita ofrecerlas).
+        var currentBranch = await GetCurrentBranchAsync(path, ct);
+        var worktreeBranches = await GetWorktreeBranchesAsync(path, ct);
+        var neverCandidates = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (!string.IsNullOrWhiteSpace(currentBranch)) neverCandidates.Add(currentBranch);
+        foreach (var worktreeBranch in worktreeBranches) neverCandidates.Add(worktreeBranch);
+
         // Get merged branches. The target is qualified as refs/heads/<name>:
         // a bare name would resolve a same-named tag before the branch
         // (gitrevisions order), which could misreport what is merged.
@@ -182,6 +190,7 @@ public class GitRepositoryService : IGitRepositoryService
 
             // Skip the target branch itself
             if (name.Equals(targetBranch, StringComparison.OrdinalIgnoreCase)) continue;
+            if (neverCandidates.Contains(name)) continue;
 
             if (mergedBranchNames.Contains(name))
             {
@@ -210,6 +219,21 @@ public class GitRepositoryService : IGitRepositoryService
         if (!IsValidBranchName(branchName))
         {
             return (false, $"Invalid branch name: '{branchName}'.");
+        }
+
+        // Defensa en profundidad: nunca borrar la rama actual ni una rama en
+        // un worktree, aunque el llamador no haya filtrado las candidatas.
+        var currentBranch = await GetCurrentBranchAsync(path, ct);
+        if (!string.IsNullOrWhiteSpace(currentBranch) &&
+            string.Equals(currentBranch, branchName, StringComparison.OrdinalIgnoreCase))
+        {
+            return (false, $"Branch '{branchName}' is the current branch and cannot be deleted.");
+        }
+
+        var worktreeBranches = await GetWorktreeBranchesAsync(path, ct);
+        if (worktreeBranches.Any(b => string.Equals(b, branchName, StringComparison.OrdinalIgnoreCase)))
+        {
+            return (false, $"Branch '{branchName}' is checked out in a worktree and cannot be deleted.");
         }
 
         // Safe delete only: never force-delete with -D. A branch git considers
@@ -573,6 +597,44 @@ public class GitRepositoryService : IGitRepositoryService
         // `--` keeps the branch name from parsing as one either.
         var result = await ExecuteGitCommandAsync(path, ["branch", "--", branchName, commitSha], ct);
         return (result.ExitCode == 0, GitOutputRedactor.Redact(string.IsNullOrWhiteSpace(result.Error) ? result.Output.Trim() : result.Error.Trim()));
+    }
+
+    public async Task<string?> GetCurrentBranchAsync(string path, CancellationToken ct = default)
+    {
+        if (!Directory.Exists(path)) return null;
+        var result = await ExecuteGitCommandAsync(path, ["branch", "--show-current"], ct);
+        if (result.ExitCode != 0) return null;
+        var name = result.Output.Trim();
+        return IsValidBranchName(name) ? name : null;
+    }
+
+    public async Task<IReadOnlyList<string>> GetWorktreeBranchesAsync(string path, CancellationToken ct = default)
+    {
+        if (!Directory.Exists(path)) return [];
+        var result = await ExecuteGitCommandAsync(path, ["worktree", "list", "--porcelain"], ct);
+        if (result.ExitCode != 0) return [];
+        var branches = new List<string>();
+        foreach (var rawLine in result.Output.Split('\n'))
+        {
+            var line = rawLine.TrimEnd('\r');
+            if (!line.StartsWith("branch ", StringComparison.Ordinal)) continue;
+            var refName = line["branch ".Length..].Trim();
+            const string prefix = "refs/heads/";
+            if (!refName.StartsWith(prefix, StringComparison.Ordinal)) continue;
+            var name = refName[prefix.Length..];
+            if (IsValidBranchName(name) && !branches.Contains(name, StringComparer.OrdinalIgnoreCase))
+                branches.Add(name);
+        }
+        return branches;
+    }
+
+    public async Task<string?> GetRepositoryRootAsync(string path, CancellationToken ct = default)
+    {
+        if (!Directory.Exists(path)) return null;
+        var result = await ExecuteGitCommandAsync(path, ["rev-parse", "--show-toplevel"], ct);
+        if (result.ExitCode != 0) return null;
+        var root = result.Output.Trim();
+        return root.Length == 0 ? null : Path.GetFullPath(root);
     }
 
     /// <summary>

@@ -96,16 +96,25 @@ public sealed class CleanCommand : AsyncCommand<CleanCommand.Settings>
     private readonly IBranchAnalyzer _analyzer;
     private readonly ITrashService _trashService;
     private readonly IBranchRiskClassifier _riskClassifier;
+    private readonly IGitSweepConfigService _configService;
+    private readonly IBranchProtectionService _protectionService;
     private readonly IAnsiConsole _console;
 
     [ActivatorUtilitiesConstructor]
-    public CleanCommand(IGitRepositoryService gitService, IBranchAnalyzer analyzer, ITrashService trashService, IBranchRiskClassifier riskClassifier, IAnsiConsole console)
+    public CleanCommand(IGitRepositoryService gitService, IBranchAnalyzer analyzer, ITrashService trashService, IBranchRiskClassifier riskClassifier, IGitSweepConfigService configService, IBranchProtectionService protectionService, IAnsiConsole console)
     {
         _gitService = gitService;
         _analyzer = analyzer;
         _trashService = trashService;
         _riskClassifier = riskClassifier;
+        _configService = configService ?? new GitSweepConfigService(gitService);
+        _protectionService = protectionService ?? new BranchProtectionService();
         _console = console;
+    }
+
+    public CleanCommand(IGitRepositoryService gitService, IBranchAnalyzer analyzer, ITrashService trashService, IBranchRiskClassifier riskClassifier, IAnsiConsole console)
+        : this(gitService, analyzer, trashService, riskClassifier, new GitSweepConfigService(gitService), new BranchProtectionService(), console)
+    {
     }
 
     public CleanCommand(IGitRepositoryService gitService, IBranchAnalyzer analyzer, ITrashService trashService, IAnsiConsole console)
@@ -193,6 +202,25 @@ public sealed class CleanCommand : AsyncCommand<CleanCommand.Settings>
             return 1;
         }
 
+        // Protección configurable: un .gitsweep.json inválido falla cerrado.
+        GitSweepConfig protectionConfig;
+        string? currentBranch;
+        IReadOnlyList<string> worktreeBranches;
+        try
+        {
+            protectionConfig = await _configService.LoadAsync(repoPath, cancellationToken)
+                ?? GitSweepConfig.Default;
+            var currentTask = _gitService.GetCurrentBranchAsync(repoPath, cancellationToken);
+            currentBranch = currentTask is null ? null : await currentTask;
+            var worktreeTask = _gitService.GetWorktreeBranchesAsync(repoPath, cancellationToken);
+            worktreeBranches = worktreeTask is null ? [] : await worktreeTask ?? [];
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException or ArgumentException)
+        {
+            WriteError($"Invalid .gitsweep.json protection configuration; refusing to clean: {ex.Message}");
+            return 1;
+        }
+
         if (settings.Fetch)
         {
             WriteProgressStep("Fetching remotes (prune)", 1, 1);
@@ -229,9 +257,17 @@ public sealed class CleanCommand : AsyncCommand<CleanCommand.Settings>
             return 0;
         }
 
-        var staleBranches = _analyzer.IdentifyStaleBranches(allBranches, staleAge).ToList();
-        var mergedBranches = _analyzer.IdentifyMergedBranches(allBranches).ToList();
-        var safeGoneBranches = (_analyzer.IdentifySafeGoneBranches(allBranches) ?? []).ToList();
+        // Excluir protegidas (glob .gitsweep.json, rama actual, worktrees)
+        // antes de cualquier análisis/borrado.
+        var protectedBranches = _protectionService.FilterProtected(
+            allBranches, protectionConfig, currentBranch, worktreeBranches, out var unprotectedBranches);
+        if (protectedBranches.Count == 0)
+            unprotectedBranches = allBranches;
+        WriteProtectionSummary(protectedBranches, protectionConfig);
+
+        var staleBranches = _analyzer.IdentifyStaleBranches(unprotectedBranches, staleAge).ToList();
+        var mergedBranches = _analyzer.IdentifyMergedBranches(unprotectedBranches).ToList();
+        var safeGoneBranches = (_analyzer.IdentifySafeGoneBranches(unprotectedBranches) ?? []).ToList();
         var candidates = BuildCandidates(staleBranches, mergedBranches, safeGoneBranches, settings).ToList();
 
         if (!candidates.Any())
@@ -299,6 +335,19 @@ public sealed class CleanCommand : AsyncCommand<CleanCommand.Settings>
             var candidate = selectedCandidates[index];
             cancellationToken.ThrowIfCancellationRequested();
             WriteProgressStep($"Deleting {candidate.Branch.Name}", index + 1, selectedCandidates.Count);
+
+            // Revalidar protección justo antes de borrar: la rama pudo
+            // pasar a ser la actual o entrar en un worktree tras el escaneo.
+            var freshCurrentTask = _gitService.GetCurrentBranchAsync(repoPath, cancellationToken);
+            var freshCurrent = freshCurrentTask is null ? currentBranch : await freshCurrentTask ?? currentBranch;
+            var freshWorktreeTask = _gitService.GetWorktreeBranchesAsync(repoPath, cancellationToken);
+            var freshWorktrees = freshWorktreeTask is null ? worktreeBranches : await freshWorktreeTask ?? worktreeBranches;
+            var protection = _protectionService.Evaluate(candidate.Branch.Name, protectionConfig, freshCurrent, freshWorktrees);
+            if (protection.IsProtected)
+            {
+                failures.Add((candidate.Branch.Name, $"Branch is protected ({protection.Reason}); it was not deleted."));
+                continue;
+            }
 
             if (freshSafeGoneNames is not null && !freshSafeGoneNames.Contains(candidate.Branch.Name))
             {
@@ -450,6 +499,45 @@ public sealed class CleanCommand : AsyncCommand<CleanCommand.Settings>
         }
 
         return assessments;
+    }
+
+    private void WriteProtectionSummary(IReadOnlyList<BranchProtectionResult> protectedBranches, GitSweepConfig config)
+    {
+        if (protectedBranches.Count == 0)
+        {
+            _console.MarkupLine("[grey]Protection: no branches excluded by .gitsweep.json, current-branch or worktree rules.[/]");
+            return;
+        }
+
+        var table = new Table()
+            .Title("[yellow]Protected branches (excluded)[/]")
+            .Border(TableBorder.Rounded)
+            .AddColumn("Branch")
+            .AddColumn("Reason")
+            .AddColumn("Pattern");
+        foreach (var item in protectedBranches.OrderBy(p => p.BranchName, StringComparer.OrdinalIgnoreCase))
+        {
+            table.AddRow(
+                $"[blue]{Markup.Escape(item.BranchName)}[/]",
+                Markup.Escape(item.Reason.ToString()),
+                Markup.Escape(item.MatchedPattern ?? "-"));
+        }
+
+        _console.Write(new Panel(table)
+        {
+            Header = new PanelHeader("Protection (.gitsweep.json)"),
+            Border = BoxBorder.Rounded
+        });
+        _console.WriteLine();
+    }
+
+    internal static Table BuildProtectionTable(IReadOnlyList<BranchProtectionResult> protectedBranches)
+    {
+        var table = new Table().Title("[yellow]Protected branches (excluded)[/]").Border(TableBorder.Rounded)
+            .AddColumn("Branch").AddColumn("Reason").AddColumn("Pattern");
+        foreach (var item in protectedBranches)
+            table.AddRow($"[blue]{Markup.Escape(item.BranchName)}[/]", Markup.Escape(item.Reason.ToString()), Markup.Escape(item.MatchedPattern ?? "-"));
+        return table;
     }
 
     private void WriteRiskTable(IReadOnlyList<BranchRiskAssessment> assessments)

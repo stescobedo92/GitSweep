@@ -79,4 +79,13 @@ public interface IGitRepositoryService
     /// SHA are validated before git is invoked.
     /// </summary>
     Task<(bool Success, string ErrorMessage)> CreateBranchAsync(string path, string branchName, string commitSha, CancellationToken ct = default);
+
+    /// <summary>Rama actualmente en checkout en <paramref name="path"/> (<c>git branch --show-current</c>), o <see langword="null"/> si HEAD está detached o no es un repo.</summary>
+    Task<string?> GetCurrentBranchAsync(string path, CancellationToken ct = default);
+
+    /// <summary>Ramas en checkout en cualquier worktree (<c>git worktree list --porcelain</c>), sin duplicados. Vacío si no es un repo.</summary>
+    Task<IReadOnlyList<string>> GetWorktreeBranchesAsync(string path, CancellationToken ct = default);
+
+    /// <summary>Raíz del working tree (<c>git rev-parse --show-toplevel</c>), o <see langword="null"/> si no es un repo.</summary>
+    Task<string?> GetRepositoryRootAsync(string path, CancellationToken ct = default);
 }

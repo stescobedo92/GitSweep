@@ -68,6 +68,9 @@ internal sealed class TypeRegistrar : ITypeRegistrar
         _services.AddSingleton<IBranchAnalyzer, BranchAnalyzer>();
         _services.AddSingleton<IBranchRiskClassifier, BranchRiskClassifier>();
         _services.AddSingleton<ITrashService, TrashService>();
+        _services.AddSingleton<IBranchProtectionService, BranchProtectionService>();
+        _services.AddSingleton<IGitSweepConfigService>(sp =>
+            new GitSweepConfigService(sp.GetRequiredService<IGitRepositoryService>()));
         _services.AddSingleton(console);
     }
 
