@@ -10,4 +10,8 @@
     <ProjectReference Include="..\GitSweep.Core\GitSweep.Core.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="GitSweep.Infrastructure.Tests" />
+  </ItemGroup>
+
 </Project>

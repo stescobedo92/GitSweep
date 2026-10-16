@@ -23,18 +23,21 @@ namespace GitSweep.Infrastructure.Services;
 /// <c>trash</c> directory makes saves throw and reads report an empty
 /// trash, and a symlinked entry file is skipped, so a planted link cannot
 /// redirect trash I/O outside <c>.git</c>.</item>
-/// <item>Entry files larger than <see cref="MaxTrashEntryBytes"/> and
-/// entries dated in the future are rejected: a real entry is a few hundred
-/// bytes written at deletion time, so either one means the file was
+/// <item>Entry files that are empty or larger than <see cref="MaxTrashEntryBytes"/>,
+/// and entries dated in the future, are rejected: a real entry is a few
+/// hundred bytes written at deletion time, so any of them means the file was
 /// planted or corrupted (a future date could otherwise hijack which batch
-/// <c>undo</c> picks).</item>
+/// <c>undo</c> picks). Emptiness is checked before the file is opened
+/// because a FIFO reports length 0 and opening it would block forever; the
+/// read itself is bounded to the cap plus one byte
+/// (see <see cref="BoundedFileReader"/>).</item>
 /// </list>
 /// </summary>
 public sealed class TrashService : ITrashService
 {
     // A serialized entry is a few hundred bytes; 64 KiB is generous
     // headroom and bounds what a planted file can make a reader allocate.
-    private const long MaxTrashEntryBytes = 64 * 1024;
+    private const int MaxTrashEntryBytes = 64 * 1024;
 
     // Small clock-skew allowance for the future-date rejection.
     private static readonly TimeSpan FutureDateSkew = TimeSpan.FromMinutes(5);
@@ -286,20 +289,18 @@ public sealed class TrashService : ITrashService
     {
         try
         {
-            // Never follow a planted link out of the trash, and never let
-            // an oversized planted file make the reader allocate unbounded
-            // memory: real entries are a few hundred bytes.
-            var fileInfo = new FileInfo(filePath);
-            if ((fileInfo.Attributes & FileAttributes.ReparsePoint) != 0 ||
-                fileInfo.Length > MaxTrashEntryBytes)
+            // Never follow a planted link out of the trash, never open an
+            // empty file (a FIFO reports length 0 and would block open(2)
+            // forever), and never read more than the cap into memory: real
+            // entries are a few hundred bytes. Anything else is skipped.
+            var read = await BoundedFileReader.ReadAsync(filePath, MaxTrashEntryBytes, ct);
+            if (read.Status != BoundedReadStatus.Ok)
             {
                 return null;
             }
 
-            await using var stream = new FileStream(
-                filePath, FileMode.Open, FileAccess.Read, FileShare.Read,
-                bufferSize: 4096, useAsync: true);
-            var entry = await JsonSerializer.DeserializeAsync<TrashEntry>(stream, JsonOptions, ct);
+            using var content = read.Content!;
+            var entry = JsonSerializer.Deserialize<TrashEntry>(content, JsonOptions);
 
             if (entry is null || !IsValidEntry(entry))
             {

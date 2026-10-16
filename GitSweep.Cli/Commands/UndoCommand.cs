@@ -54,7 +54,7 @@ public sealed class UndoCommand : AsyncCommand<UndoCommand.Settings>
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException or ArgumentException)
         {
-            _console.MarkupLine($"[red]Error:[/] {Markup.Escape(ex.Message)}");
+            _console.MarkupLine($"[red]Error:[/] {TerminalText.Markup(ex.Message)}");
             return 1;
         }
     }
@@ -66,7 +66,7 @@ public sealed class UndoCommand : AsyncCommand<UndoCommand.Settings>
 
         if (!await _gitService.IsGitRepositoryAsync(repoPath, cancellationToken))
         {
-            _console.MarkupLine($"[red]Error:[/] '[blue]{Markup.Escape(displayPath)}[/]' is not a Git repository.");
+            _console.MarkupLine($"[red]Error:[/] '[blue]{TerminalText.Markup(displayPath)}[/]' is not a Git repository.");
             return 1;
         }
 
@@ -105,7 +105,9 @@ public sealed class UndoCommand : AsyncCommand<UndoCommand.Settings>
                 foreach (var entry in batch)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
-                    task.Description = $"Restoring {entry.BranchName}";
+                    // Spectre parses a task description as markup (SEC-B01: a branch
+                    // named "fix]" crashed the live display mid-batch).
+                    task.Description = $"Restoring {TerminalText.Markup(entry.BranchName)}";
                     var result = await TrashRestoreHelper.RestoreEntryAsync(
                         _gitService, _trashService, repoPath, entry, cancellationToken);
                     switch (result.Outcome)
@@ -113,16 +115,16 @@ public sealed class UndoCommand : AsyncCommand<UndoCommand.Settings>
                         case TrashRestoreHelper.RestoreOutcome.Restored:
                             restored++;
                             _console.MarkupLine(
-                                $"[green]Restored[/] '[blue]{Markup.Escape(entry.BranchName)}[/]' at [grey]{Markup.Escape(TrashRestoreHelper.ShortSha(entry.CommitSha))}[/].");
+                                $"[green]Restored[/] '[blue]{TerminalText.Markup(entry.BranchName)}[/]' at [grey]{TerminalText.Markup(TrashRestoreHelper.ShortSha(entry.CommitSha))}[/].");
                             break;
                         case TrashRestoreHelper.RestoreOutcome.AlreadyExists:
                             failures.Add(result.ErrorMessage!);
-                            _console.MarkupLine($"[yellow]{Markup.Escape(result.ErrorMessage!)}[/]");
+                            _console.MarkupLine($"[yellow]{TerminalText.Markup(result.ErrorMessage)}[/]");
                             break;
                         default:
                             failures.Add($"'{entry.BranchName}': {result.ErrorMessage}");
                             _console.MarkupLine(
-                                $"[red]Failed to restore '[blue]{Markup.Escape(entry.BranchName)}[/]':[/] {Markup.Escape(result.ErrorMessage ?? "unknown error")}");
+                                $"[red]Failed to restore '[blue]{TerminalText.Markup(entry.BranchName)}[/]':[/] {TerminalText.Markup(result.ErrorMessage ?? "unknown error", allowNewlines: true)}");
                             break;
                     }
 

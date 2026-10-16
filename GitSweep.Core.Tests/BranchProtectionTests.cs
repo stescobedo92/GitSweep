@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using GitSweep.Core.Models;
 using GitSweep.Core.Services;
 using GitSweep.Infrastructure.Services;
@@ -72,6 +73,74 @@ public class BranchProtectionTests
         Assert.True(_sut.Evaluate("main", GitSweepConfig.Default, null, []).IsProtected);
         Assert.True(_sut.Evaluate("master", GitSweepConfig.Default, null, []).IsProtected);
         Assert.False(_sut.Evaluate("feature/x", GitSweepConfig.Default, null, []).IsProtected);
+    }
+
+    [Fact]
+    public void BuiltInProtectedBranches_are_exactly_main_and_master() =>
+        Assert.Equal(["main", "master"], GitSweepConfig.BuiltInProtectedBranches);
+
+    [Theory]
+    [InlineData("main")]
+    [InlineData("master")]
+    [InlineData("MAIN")]
+    [InlineData("Master")]
+    public void Evaluate_empty_config_still_protects_builtin_main_and_master(string branch)
+    {
+        var result = _sut.Evaluate(branch, GitSweepConfig.Empty, null, []);
+        Assert.True(result.IsProtected);
+        Assert.Equal(BranchProtectionReason.GlobPattern, result.Reason);
+    }
+
+    [Fact]
+    public void Evaluate_test_constructed_config_without_patterns_still_protects_builtins()
+    {
+        var config = new GitSweepConfig([], ExcludeCurrentBranch: false, ExcludeWorktreeBranches: false);
+        Assert.True(_sut.Evaluate("main", config, "feature/x", ["feature/x"]).IsProtected);
+        Assert.True(_sut.Evaluate("master", config, "feature/x", ["feature/x"]).IsProtected);
+    }
+
+    [Fact]
+    public void Evaluate_null_pattern_list_still_protects_builtins_fail_closed()
+    {
+        var config = new GitSweepConfig(null!);
+        Assert.True(_sut.Evaluate("main", config, null, []).IsProtected);
+        Assert.True(_sut.Evaluate("master", config, null, []).IsProtected);
+        Assert.False(_sut.Evaluate("feature/x", config, null, []).IsProtected);
+    }
+
+    [Fact]
+    public void Evaluate_configured_patterns_are_unioned_with_builtins()
+    {
+        var config = new GitSweepConfig(["release/*"]);
+        Assert.True(_sut.Evaluate("main", config, null, []).IsProtected);
+        Assert.True(_sut.Evaluate("master", config, null, []).IsProtected);
+        var release = _sut.Evaluate("release/x", config, null, []);
+        Assert.True(release.IsProtected);
+        Assert.Equal("release/*", release.MatchedPattern);
+        Assert.False(_sut.Evaluate("feature/x", config, null, []).IsProtected);
+    }
+
+    [Theory]
+    [InlineData("main-extra")]
+    [InlineData("domain")]
+    [InlineData("mainline")]
+    [InlineData("feature/main")]
+    [InlineData("master2")]
+    public void Evaluate_builtins_match_whole_name_only(string branch) =>
+        Assert.False(_sut.Evaluate(branch, GitSweepConfig.Empty, null, []).IsProtected);
+
+    [Fact]
+    public void FilterProtected_with_empty_config_never_leaves_main_or_master_unprotected()
+    {
+        var branches = new List<BranchInfo>
+        {
+            new("main", DateTime.UtcNow, true),
+            new("master", DateTime.UtcNow, true),
+            new("feature/old", DateTime.UtcNow.AddMonths(-9), false),
+        };
+        var protectedResults = _sut.FilterProtected(branches, GitSweepConfig.Empty, null, [], out var unprotected);
+        Assert.Equal(["main", "master"], protectedResults.Select(r => r.BranchName).ToList());
+        Assert.Equal(["feature/old"], unprotected.Select(b => b.Name).ToList());
     }
 
     [Fact]

@@ -30,7 +30,9 @@ app.Configure(config =>
     config.SetExceptionHandler((ex, resolver) =>
     {
         var ansiConsole = resolver?.Resolve(typeof(IAnsiConsole)) as IAnsiConsole ?? console;
-        ansiConsole.MarkupLine($"[red]Error:[/] {Markup.Escape(ex.Message)}");
+        // Exception messages can quote external text (paths, git output,
+        // option values): make control characters visible, then escape.
+        ansiConsole.MarkupLine($"[red]Error:[/] {TerminalText.Markup(ex.Message)}");
         return 1;
     });
     config.AddExample("--dry-run");

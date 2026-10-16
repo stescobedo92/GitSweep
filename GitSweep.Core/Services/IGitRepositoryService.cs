@@ -16,10 +16,13 @@ public interface IGitRepositoryService
     /// <c>--prune --no-tags</c>, so remote-tracking refs deleted on the
     /// remote are removed locally and their local branches become
     /// detectable as upstream-gone. Fetching by URL (never by remote name)
-    /// ignores every repository-configured refspec, so a hostile
-    /// <c>remote.origin.fetch</c> cannot make the prune move or delete a
-    /// local branch; no local branch or tag is ever created, moved, deleted
-    /// or force-updated. Without an <c>origin</c> remote it fails closed.
+    /// still lets git apply a <c>[remote "&lt;url&gt;"]</c> config section a
+    /// hostile repo can plant, so the fetch also pins
+    /// <c>--upload-pack=git-upload-pack</c> (no repo-configured program runs)
+    /// and clears the opportunistic refmap with <c>--refmap=</c> (a hostile
+    /// <c>fetch = +refs/heads/*:refs/heads/*</c> cannot move or delete a local
+    /// branch); no local branch or tag is ever created, moved, deleted or
+    /// force-updated. Without an <c>origin</c> remote it fails closed.
     /// A failure is reported (never hidden) so callers can fail closed and
     /// refuse to classify gone branches from stale remote state. Transport
     /// helpers named by repository config (ssh/proxy/credential programs,

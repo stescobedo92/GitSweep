@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Security.Cryptography;
+using System.Text;
 using System.Threading.Tasks;
 using GitSweep.Core.Models;
 using GitSweep.Infrastructure.Services;
@@ -278,16 +280,74 @@ public sealed class SquashMergeDetectionTests : IAsyncLifetime
         // auto-gc / auto-maintenance are disabled on every git invocation.
         var hooksDirectory = Path.Combine(_repoPath, "hostile-hooks");
         Directory.CreateDirectory(hooksDirectory);
-        await File.WriteAllTextAsync(
+        var marker = Path.Combine(_repoPath, "gitsweep-hook-marker.txt");
+        // Exiting non-zero makes git cancel the auto-gc instead of repacking,
+        // so the loose objects planted below stay in place for the scan.
+        await TestScripts.WriteExecutableAsync(
             Path.Combine(hooksDirectory, "pre-auto-gc"),
-            "#!/bin/sh\necho ran > gitsweep-hook-marker.txt\n");
+            "#!/bin/sh\necho ran > gitsweep-hook-marker.txt\nexit 1\n");
         await RunGitAsync("config", "core.hooksPath", hooksDirectory);
         await RunGitAsync("config", "gc.auto", "1");
+        await PlantLooseObjectsThatTriggerAutoGcAsync();
+
+        // Fixture control only: plain git does run the hook with this setup
+        // (it is executable and auto-gc is due), so the fixture itself is
+        // honest on every OS. This does NOT give the final assertion teeth:
+        // the scan path (IsSquashOrRebaseMergedAsync) runs only plumbing
+        // (cherry, merge-base, rev-parse, commit-tree), and no plumbing
+        // command triggers `gc --auto` (only porcelain such as commit, merge
+        // or fetch does), so the assertion below passes regardless of the
+        // gc.auto=0 hardening. Exercising a porcelain path is tracked
+        // separately.
+        await RunGitAsync("-c", "gc.autoDetach=false", "gc", "--auto");
+        Assert.True(File.Exists(marker), "plain `git gc --auto` did not run the planted pre-auto-gc hook");
+        File.Delete(marker);
 
         var detected = await _sut.IsSquashOrRebaseMergedAsync(_repoPath, "main", "feature/squash");
 
         Assert.True(detected);
-        Assert.False(File.Exists(Path.Combine(_repoPath, "gitsweep-hook-marker.txt")));
+        Assert.False(File.Exists(marker), "repo pre-auto-gc hook was executed");
+    }
+
+    /// <summary>
+    /// Makes <c>git gc --auto</c> consider the repository due for gc (with
+    /// <c>gc.auto=1</c>). Git estimates the loose-object count by looking only
+    /// at <c>objects/17</c> and needs more than <c>ceil(gc.auto / 256) = 1</c>
+    /// entries there; a few commits land in that bucket only by chance, so
+    /// store two blobs whose ids are known to start with <c>17</c>.
+    /// </summary>
+    private async Task PlantLooseObjectsThatTriggerAutoGcAsync()
+    {
+        const int needed = 2;
+        var probeFile = Path.Combine(_repoPath, ".git", "gitsweep-auto-gc-probe.tmp");
+        var planted = 0;
+        for (var attempt = 0; planted < needed && attempt < 100_000; attempt++)
+        {
+            var content = Encoding.UTF8.GetBytes($"auto-gc probe {attempt}\n");
+            var expectedId = BlobId(content);
+            if (!expectedId.StartsWith("17", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            await File.WriteAllBytesAsync(probeFile, content);
+            var storedId = (await RunGitAsync("hash-object", "-w", "--no-filters", probeFile)).Trim();
+            Assert.Equal(expectedId, storedId);
+            planted++;
+        }
+
+        File.Delete(probeFile);
+        Assert.Equal(needed, planted);
+    }
+
+    // Object id git assigns to a blob: SHA-1 over "blob <length>\0<content>".
+    private static string BlobId(byte[] content)
+    {
+        var header = Encoding.ASCII.GetBytes($"blob {content.Length}\0");
+        var buffer = new byte[header.Length + content.Length];
+        header.CopyTo(buffer, 0);
+        content.CopyTo(buffer, header.Length);
+        return Convert.ToHexString(SHA1.HashData(buffer)).ToLowerInvariant();
     }
 
     private async Task<int> CountLooseObjectsAsync()

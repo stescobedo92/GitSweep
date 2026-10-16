@@ -230,8 +230,11 @@ public sealed class CleanCommand : AsyncCommand<CleanCommand.Settings>
                 // Redacted at the display point as well as in the service:
                 // a fetch error quotes the remote URL, which may embed
                 // credentials that must never reach the terminal.
+                // The text is git's stderr, including any `remote:` sideband
+                // lines the remote sent: control characters are made visible
+                // (WriteError), only its line breaks are kept.
                 var reason = string.IsNullOrWhiteSpace(fetchError) ? "unknown error" : GitOutputRedactor.Redact(fetchError.Trim());
-                WriteError($"Fetch with prune failed; refusing to detect gone branches from stale remote state: {reason}");
+                WriteError($"Fetch with prune failed; refusing to detect gone branches from stale remote state: {reason}", allowNewlines: true);
                 return 1;
             }
         }
@@ -334,7 +337,7 @@ public sealed class CleanCommand : AsyncCommand<CleanCommand.Settings>
         {
             var candidate = selectedCandidates[index];
             cancellationToken.ThrowIfCancellationRequested();
-            WriteProgressStep($"Deleting {candidate.Branch.Name}", index + 1, selectedCandidates.Count);
+            WriteProgressStep($"Deleting {TerminalText.Sanitize(candidate.Branch.Name)}", index + 1, selectedCandidates.Count);
 
             // Revalidar protección justo antes de borrar: la rama pudo
             // pasar a ser la actual o entrar en un worktree tras el escaneo.
@@ -429,10 +432,10 @@ public sealed class CleanCommand : AsyncCommand<CleanCommand.Settings>
             var reason = string.IsNullOrWhiteSpace(failure.ErrorMessage)
                 ? "unknown error"
                 : failure.ErrorMessage.Trim();
-            _console.MarkupLine($"[red]Failed to delete branch '[blue]{Markup.Escape(failure.BranchName)}[/]':[/] {Markup.Escape(reason)}");
+            _console.MarkupLine($"[red]Failed to delete branch '[blue]{TerminalText.Markup(failure.BranchName)}[/]':[/] {TerminalText.Markup(reason, allowNewlines: true)}");
             if (reason.Contains("not fully merged", StringComparison.OrdinalIgnoreCase))
             {
-                _console.MarkupLine($"  [grey]Tip: Use [blue]git branch -D {Markup.Escape(failure.BranchName)}[/] to force-delete this branch if you no longer need its changes.[/]");
+                _console.MarkupLine($"  [grey]Tip: Use [blue]git branch -D {TerminalText.Markup(failure.BranchName)}[/] to force-delete this branch if you no longer need its changes.[/]");
             }
         }
 
@@ -518,9 +521,9 @@ public sealed class CleanCommand : AsyncCommand<CleanCommand.Settings>
         foreach (var item in protectedBranches.OrderBy(p => p.BranchName, StringComparer.OrdinalIgnoreCase))
         {
             table.AddRow(
-                $"[blue]{Markup.Escape(item.BranchName)}[/]",
-                Markup.Escape(item.Reason.ToString()),
-                Markup.Escape(item.MatchedPattern ?? "-"));
+                $"[blue]{TerminalText.Markup(item.BranchName)}[/]",
+                TerminalText.Markup(item.Reason.ToString()),
+                TerminalText.Markup(item.MatchedPattern ?? "-"));
         }
 
         _console.Write(new Panel(table)
@@ -536,7 +539,7 @@ public sealed class CleanCommand : AsyncCommand<CleanCommand.Settings>
         var table = new Table().Title("[yellow]Protected branches (excluded)[/]").Border(TableBorder.Rounded)
             .AddColumn("Branch").AddColumn("Reason").AddColumn("Pattern");
         foreach (var item in protectedBranches)
-            table.AddRow($"[blue]{Markup.Escape(item.BranchName)}[/]", Markup.Escape(item.Reason.ToString()), Markup.Escape(item.MatchedPattern ?? "-"));
+            table.AddRow($"[blue]{TerminalText.Markup(item.BranchName)}[/]", TerminalText.Markup(item.Reason.ToString()), TerminalText.Markup(item.MatchedPattern ?? "-"));
         return table;
     }
 
@@ -568,10 +571,10 @@ public sealed class CleanCommand : AsyncCommand<CleanCommand.Settings>
         {
             var signals = assessment.Signals;
             table.AddRow(
-                $"[blue]{Markup.Escape(assessment.Branch.Name)}[/]",
+                $"[blue]{TerminalText.Markup(assessment.Branch.Name)}[/]",
                 RiskMarkup(assessment.Level),
-                Markup.Escape(FormatCount(signals.UniqueCommitCount)),
-                Markup.Escape(FormatCount(signals.UnpushedCommitCount)),
+                TerminalText.Markup(FormatCount(signals.UniqueCommitCount)),
+                TerminalText.Markup(FormatCount(signals.UnpushedCommitCount)),
                 signals.HasUpstream ? "yes" : assessment.Branch.IsUpstreamGone || signals.IsUpstreamGone ? "gone" : "no",
                 assessment.Branch.IsEffectivelyMerged || signals.IsReallyMerged ? "yes" : "no");
         }
@@ -608,7 +611,7 @@ public sealed class CleanCommand : AsyncCommand<CleanCommand.Settings>
                 .PageSize(10)
                 .MoreChoicesText("[grey](Move up and down to reveal more branches.)[/]")
                 .InstructionsText("[grey](Press [blue]<space>[/] to toggle a branch, [green]<enter>[/] to continue.)[/]")
-                .UseConverter(candidate => $"{Markup.Escape(candidate.Branch.Name)} [grey]({Markup.Escape(candidate.Reason)})[/]")
+                .UseConverter(candidate => $"{TerminalText.Markup(candidate.Branch.Name)} [grey]({TerminalText.Markup(candidate.Reason)})[/]")
                 .AddChoices(candidates)
         ).ToList();
     }
@@ -671,10 +674,11 @@ public sealed class CleanCommand : AsyncCommand<CleanCommand.Settings>
 
     private void WriteRepositorySummary(string repoPath, string defaultBranch, int staleAge, Settings settings)
     {
+        // Sanitized before the panel measures its column widths.
         var rows = new[]
         {
-            ("Repository", repoPath, Blue),
-            ("Target branch", defaultBranch, Green),
+            ("Repository", TerminalText.Sanitize(repoPath), Blue),
+            ("Target branch", TerminalText.Sanitize(defaultBranch), Green),
             ("Stale age", $"{staleAge} month(s)", Yellow),
             ("Mode", GetModeText(settings), Cyan),
         };
@@ -685,7 +689,13 @@ public sealed class CleanCommand : AsyncCommand<CleanCommand.Settings>
 
     private void WriteCandidateTable(IReadOnlyCollection<BranchCleanupCandidate> candidates)
     {
-        var branchWidth = Math.Max("Branch".Length, candidates.Max(candidate => candidate.Branch.Name.Length));
+        // Branch names are sanitized before the column width is measured, so
+        // a name with an escaped character (U+202E shown as \u202E) keeps the
+        // table aligned.
+        var rows = candidates
+            .Select(candidate => (Candidate: candidate, Name: TerminalText.Sanitize(candidate.Branch.Name)))
+            .ToList();
+        var branchWidth = Math.Max("Branch".Length, rows.Max(row => row.Name.Length));
         var reasonWidth = Math.Max("Reason".Length, candidates.Max(candidate => candidate.Reason.Length));
         var dateWidth = Math.Max("Last commit".Length, candidates.Max(candidate => FormatDate(candidate.Branch.LastCommitDate).Length));
         var border = $"+-{new string('-', branchWidth)}-+-{new string('-', reasonWidth)}-+-{new string('-', dateWidth)}-+";
@@ -694,11 +704,11 @@ public sealed class CleanCommand : AsyncCommand<CleanCommand.Settings>
         WriteTableRow("Branch", "Reason", "Last commit", branchWidth, reasonWidth, dateWidth, Bold + BrightGreen, Bold + BrightGreen, Bold + BrightGreen);
         WriteAnsiLine(border.Replace('-', '='), Green);
 
-        foreach (var candidate in candidates)
+        foreach (var (candidate, name) in rows)
         {
             var reasonColor = candidate.Reason is "merged" or "squash-merged" || candidate.Reason.StartsWith("gone", StringComparison.Ordinal) ? BrightGreen : Yellow;
             WriteTableRow(
-                candidate.Branch.Name,
+                name,
                 candidate.Reason,
                 FormatDate(candidate.Branch.LastCommitDate),
                 branchWidth,
@@ -722,10 +732,12 @@ public sealed class CleanCommand : AsyncCommand<CleanCommand.Settings>
         WriteAnsiLine("100%", Bold + BrightGreen);
     }
 
-    private void WriteError(string message)
+    // Raw writer: error messages quote external text (paths, exception and
+    // config messages, git stderr), so the whole message is sanitized here.
+    private void WriteError(string message, bool allowNewlines = false)
     {
         WriteAnsi("Error: ", Bold + Red);
-        _console.Profile.Out.Writer.WriteLine(message);
+        _console.Profile.Out.Writer.WriteLine(TerminalText.Sanitize(message, allowNewlines));
     }
 
     private static string GetModeText(Settings settings)
@@ -820,10 +832,13 @@ public sealed class CleanCommand : AsyncCommand<CleanCommand.Settings>
         _console.Profile.Out.Writer.WriteLine();
     }
 
+    // Raw writer: only the color is a GitSweep-authored escape sequence; the
+    // text is always sanitized (a no-op for GitSweep's own labels), so no
+    // repository-derived text can reach the terminal unsanitized this way.
     private void WriteAnsi(string text, string color)
     {
         _console.Profile.Out.Writer.Write(color);
-        _console.Profile.Out.Writer.Write(text);
+        _console.Profile.Out.Writer.Write(TerminalText.Sanitize(text));
         _console.Profile.Out.Writer.Write(Reset);
     }
 

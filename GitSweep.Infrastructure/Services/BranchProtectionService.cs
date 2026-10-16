@@ -21,7 +21,12 @@ public sealed class BranchProtectionService : IBranchProtectionService
             worktreeBranches.Any(w => string.Equals(w, branchName, StringComparison.OrdinalIgnoreCase)))
             return new BranchProtectionResult(branchName, BranchProtectionReason.WorktreeBranch);
 
-        var pattern = BranchGlobMatcher.FirstMatchingPattern(branchName, config.ProtectedBranches ?? []);
+        // Unión de la protección integrada (main/master) y los patrones
+        // configurados: el fichero solo puede añadir. Aunque la lista llegue
+        // vacía o nula (config construida a mano), los integrados se aplican,
+        // con la misma comparación insensible a mayúsculas que el resto.
+        var pattern = BranchGlobMatcher.FirstMatchingPattern(
+            branchName, GitSweepConfig.BuiltInProtectedBranches.Concat(config.ProtectedBranches ?? []));
         return pattern is not null
             ? new BranchProtectionResult(branchName, BranchProtectionReason.GlobPattern, pattern)
             : BranchProtectionResult.NotProtected(branchName);

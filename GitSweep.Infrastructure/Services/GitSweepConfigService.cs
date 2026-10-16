@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using GitSweep.Core.Models;
 using GitSweep.Core.Services;
 
@@ -7,13 +8,20 @@ namespace GitSweep.Infrastructure.Services;
 /// <summary>
 /// Lee <c>.gitsweep.json</c> solo con <see cref="System.Text.Json"/> (sin YAML).
 /// El fichero vive en un repo posiblemente clonado, así que es entrada no
-/// confiable: tamaño acotado, sin comentarios ni comas finales, profundidad
-/// acotada, patrones validados y ningún contenido del fichero en los errores
-/// (podría contener secretos pegados por error).
+/// confiable: lectura acotada (tamaño máximo, nunca abre un fichero vacío o
+/// una FIFO, ni sigue enlaces; ver <see cref="BoundedFileReader"/>), sin
+/// comentarios ni comas finales, profundidad acotada, patrones validados y
+/// ningún contenido del fichero en los errores
+/// (podría contener secretos pegados por error). La lectura es estricta: una
+/// propiedad desconocida, mal escrita (<c>protected_branches</c>) o duplicada
+/// falla cerrado en vez de ignorarse, porque ignorarla dejaría al usuario sin la
+/// protección que cree haber configurado. Una <c>protectedBranches</c> ausente,
+/// nula o vacía es válida y significa «sin patrones extra»; la protección
+/// integrada de <c>main</c>/<c>master</c> no depende del fichero.
 /// </summary>
 public sealed class GitSweepConfigService : IGitSweepConfigService
 {
-    internal const long MaxConfigBytes = 64 * 1024;
+    internal const int MaxConfigBytes = 64 * 1024;
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -22,6 +30,10 @@ public sealed class GitSweepConfigService : IGitSweepConfigService
         AllowTrailingCommas = false,
         ReadCommentHandling = JsonCommentHandling.Disallow,
         MaxDepth = 32,
+        // Estricto: propiedades desconocidas o duplicadas lanzan JsonException
+        // (que LoadAsync convierte en InvalidOperationException sin contenido).
+        UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow,
+        AllowDuplicateProperties = false,
     };
 
     private readonly IGitRepositoryService? _gitService;
@@ -65,17 +77,28 @@ public sealed class GitSweepConfigService : IGitSweepConfigService
                 return GitSweepConfig.Default;
         }
 
-        var info = new FileInfo(configPath);
-        if ((info.Attributes & FileAttributes.ReparsePoint) != 0)
-            throw new InvalidOperationException($".gitsweep.json at '{configPath}' is a symbolic link; refusing to read it.");
-        if (info.Length > MaxConfigBytes)
-            throw new InvalidOperationException($".gitsweep.json exceeds the {MaxConfigBytes} byte limit; refusing to read it.");
+        // Lectura acotada: sin seguir enlaces, sin abrir longitud 0 (una FIFO
+        // bloquearía open(2) para siempre) y sin leer más de límite + 1 bytes.
+        var read = await BoundedFileReader.ReadAsync(configPath, MaxConfigBytes, ct);
+        switch (read.Status)
+        {
+            case BoundedReadStatus.Link:
+                throw new InvalidOperationException($".gitsweep.json at '{configPath}' is a symbolic link; refusing to read it.");
+            case BoundedReadStatus.Empty:
+                throw new InvalidOperationException(".gitsweep.json is empty; refusing to clean without verified protection.");
+            case BoundedReadStatus.TooLarge:
+                throw new InvalidOperationException($".gitsweep.json exceeds the {MaxConfigBytes} byte limit; refusing to read it.");
+            case BoundedReadStatus.Ok:
+                break;
+            default:
+                throw new InvalidOperationException(".gitsweep.json could not be read; refusing to clean without verified protection.");
+        }
 
         GitSweepConfigDto? dto;
         try
         {
-            await using var stream = new FileStream(configPath, FileMode.Open, FileAccess.Read, FileShare.Read, 4096, useAsync: true);
-            dto = await JsonSerializer.DeserializeAsync<GitSweepConfigDto>(stream, JsonOptions, ct);
+            using var content = read.Content!;
+            dto = JsonSerializer.Deserialize<GitSweepConfigDto>(content, JsonOptions);
         }
         catch (JsonException ex)
         {
@@ -86,6 +109,7 @@ public sealed class GitSweepConfigService : IGitSweepConfigService
         if (dto is null)
             throw new InvalidOperationException(".gitsweep.json is empty; refusing to clean without verified protection.");
 
+        // Ausente, nula o vacía = sin patrones extra (los integrados siempre aplican).
         var patterns = dto.ProtectedBranches ?? [];
         if (patterns.Count > GitSweepConfig.MaxProtectedPatterns)
             throw new InvalidOperationException($".gitsweep.json declares more than {GitSweepConfig.MaxProtectedPatterns} protected patterns; refusing to clean.");

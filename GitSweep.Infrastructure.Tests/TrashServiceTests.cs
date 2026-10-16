@@ -195,7 +195,7 @@ public sealed class TrashServiceTests : IAsyncLifetime
         var hooksDirectory = Path.Combine(_repoPath, "hostile-hooks");
         Directory.CreateDirectory(hooksDirectory);
         var marker = Path.Combine(_repoPath, "gitsweep-hook-marker.txt");
-        await File.WriteAllTextAsync(
+        await TestScripts.WriteExecutableAsync(
             Path.Combine(hooksDirectory, "reference-transaction"),
             $"#!/bin/sh\necho ran >> {marker.Replace('\\', '/')}\n");
         await RunGitAsync($"config core.hooksPath {hooksDirectory}");
@@ -239,27 +239,20 @@ public sealed class TrashServiceTests : IAsyncLifetime
         Assert.Null(await _sut.GetAsync(_repoPath, id));
     }
 
-    [Fact]
+    [FileSymlinkFact]
     public async Task ListAsync_skips_symlinked_entry_files()
     {
         Directory.CreateDirectory(TrashDirectory);
         var id = Guid.NewGuid().ToString("N");
         var targetPath = Path.Combine(_repoPath, "outside-entry.json");
         await File.WriteAllTextAsync(targetPath, RawEntryJson(id, DateTimeOffset.UtcNow));
-        try
-        {
-            File.CreateSymbolicLink(Path.Combine(TrashDirectory, id + ".json"), targetPath);
-        }
-        catch (Exception)
-        {
-            return; // This platform/account cannot create symlinks.
-        }
+        TestLinks.CreateFileSymlink(Path.Combine(TrashDirectory, id + ".json"), targetPath);
 
         Assert.Empty(await _sut.ListAsync(_repoPath));
         Assert.Null(await _sut.GetAsync(_repoPath, id));
     }
 
-    [Fact]
+    [DirectoryLinkFact]
     public async Task SaveAsync_refuses_symlinked_trash_directory()
     {
         var outside = Path.Combine(Path.GetTempPath(), "GitSweepTrashOutside", Guid.NewGuid().ToString("N"));
@@ -267,17 +260,13 @@ public sealed class TrashServiceTests : IAsyncLifetime
         var gitsweepPath = Path.Combine(_repoPath, ".git", "gitsweep");
         try
         {
-            Directory.CreateSymbolicLink(gitsweepPath, outside);
+            // Symlink, or a junction on Windows without symlink privilege.
+            TestLinks.CreateDirectoryLink(gitsweepPath, outside);
         }
         catch (Exception)
         {
-            // Symlinks need extra privilege on Windows; a directory
-            // junction is also a reparse point and needs none.
-            if (!TryCreateJunction(gitsweepPath, outside))
-            {
-                Directory.Delete(outside, recursive: true);
-                return; // This platform/account cannot create any link.
-            }
+            Directory.Delete(outside, recursive: true);
+            throw;
         }
 
         try
@@ -295,29 +284,70 @@ public sealed class TrashServiceTests : IAsyncLifetime
         }
     }
 
-    private static bool TryCreateJunction(string linkPath, string targetPath)
+    [Fact]
+    public async Task ListAsync_and_GetAsync_skip_entry_whose_id_does_not_match_its_file_name()
     {
-        try
-        {
-            var startInfo = new ProcessStartInfo
-            {
-                FileName = "cmd.exe",
-                Arguments = $"/c mklink /J \"{linkPath}\" \"{targetPath}\"",
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true
-            };
+        // A valid entry copied to <another-guid>.json keeps the original Id
+        // inside. Without the Id == file name check it would be listed (and
+        // restoring it would delete the original entry's file, the only SHA
+        // record of another deleted branch).
+        var original = await _sut.SaveAsync(_repoPath, "feature/to-delete", _branchSha, Guid.NewGuid());
+        var foreignId = Guid.NewGuid().ToString("N");
+        File.Copy(
+            Path.Combine(TrashDirectory, original.Id + ".json"),
+            Path.Combine(TrashDirectory, foreignId + ".json"));
 
-            using var process = new Process { StartInfo = startInfo };
-            process.Start();
-            process.WaitForExit();
-            return process.ExitCode == 0 && Directory.Exists(linkPath);
-        }
-        catch (Exception)
-        {
-            return false;
-        }
+        var listed = await _sut.ListAsync(_repoPath);
+
+        var only = Assert.Single(listed);
+        Assert.Equal(original, only);
+        Assert.Null(await _sut.GetAsync(_repoPath, foreignId));
+        Assert.Equal(original, await _sut.GetAsync(_repoPath, original.Id));
+    }
+
+    [Fact]
+    public async Task ListAsync_skips_empty_entry_files()
+    {
+        Directory.CreateDirectory(TrashDirectory);
+        var id = Guid.NewGuid().ToString("N");
+        await File.WriteAllBytesAsync(Path.Combine(TrashDirectory, id + ".json"), []);
+
+        Assert.Empty(await _sut.ListAsync(_repoPath));
+        Assert.Null(await _sut.GetAsync(_repoPath, id));
+    }
+
+    [Fact]
+    public async Task ListAsync_accepts_entry_file_of_exactly_the_size_cap()
+    {
+        // The bounded read holds cap + 1 bytes to detect an oversized file;
+        // an entry of exactly the cap must still load (no off-by-one).
+        Directory.CreateDirectory(TrashDirectory);
+        var id = Guid.NewGuid().ToString("N");
+        var json = RawEntryJson(id, DateTimeOffset.UtcNow);
+        var path = Path.Combine(TrashDirectory, id + ".json");
+        await File.WriteAllTextAsync(path, json + new string(' ', 64 * 1024 - json.Length));
+        Assert.Equal(64 * 1024, new FileInfo(path).Length);
+
+        var entry = Assert.Single(await _sut.ListAsync(_repoPath));
+        Assert.Equal(id, entry.Id);
+        Assert.NotNull(await _sut.GetAsync(_repoPath, id));
+    }
+
+    [FifoFact]
+    public async Task ListAsync_and_GetAsync_skip_fifo_entry_instead_of_hanging()
+    {
+        // A FIFO named like an entry (shippable in a tar archive) reports
+        // length 0 and blocks open(2) until a writer appears.
+        var real = await _sut.SaveAsync(_repoPath, "feature/to-delete", _branchSha, Guid.NewGuid());
+        var fifoId = Guid.NewGuid().ToString("N");
+        var fifoPath = Path.Combine(TrashDirectory, fifoId + ".json");
+        TestFifo.Create(fifoPath);
+
+        var listed = await TestFifo.CompleteWithinTimeoutAsync(fifoPath, () => _sut.ListAsync(_repoPath));
+        var fetched = await TestFifo.CompleteWithinTimeoutAsync(fifoPath, () => _sut.GetAsync(_repoPath, fifoId));
+
+        Assert.Equal(real, Assert.Single(listed));
+        Assert.Null(fetched);
     }
 
     private string RawEntryJson(string id, DateTimeOffset deletedAtUtc) =>

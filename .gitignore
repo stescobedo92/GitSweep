@@ -369,3 +369,6 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
+
+# GitSweep test/build temp repos (created by test runs)
+.tmp-build/

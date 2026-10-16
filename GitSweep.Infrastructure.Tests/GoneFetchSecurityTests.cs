@@ -56,10 +56,18 @@ public sealed class GoneFetchSecurityTests : IAsyncLifetime
         var marker = Path.Combine(_root, "ssh-owned.txt");
         var scriptPath = Path.Combine(_root, "pwn.sh");
         var forwardRoot = _root.Replace('\\', '/');
-        await File.WriteAllTextAsync(scriptPath,
+        await TestScripts.WriteExecutableAsync(scriptPath,
             $"#!/bin/sh\necho owned > {forwardRoot}/ssh-owned.txt\nexit 1\n");
         await RunGitAsync(repo, "config", "core.sshCommand", $"{forwardRoot}/pwn.sh");
         await RunGitAsync(repo, "remote", "add", "origin", "git@127.0.0.1:repo.git");
+
+        // Positive control: plain git does run the repo-configured ssh
+        // command with this setup. The script exits 1, so `ls-remote` fails
+        // at once without touching the network. Without this proof a script
+        // git cannot run would make the assertion below pass vacuously.
+        await Assert.ThrowsAsync<InvalidOperationException>(() => RunGitAsync(repo, "ls-remote", "origin"));
+        Assert.True(File.Exists(marker), "plain `git ls-remote` did not run the planted core.sshCommand script");
+        File.Delete(marker);
 
         var fetch = await _sut.FetchPruneAsync(repo);
 
@@ -171,7 +179,7 @@ public sealed class GoneFetchSecurityTests : IAsyncLifetime
         var fakeBin = Path.Combine(_root, "fake-bin");
         Directory.CreateDirectory(fakeBin);
         var marker = Path.Combine(_root, "remote-helper-owned.txt");
-        await File.WriteAllTextAsync(
+        await TestScripts.WriteExecutableAsync(
             Path.Combine(fakeBin, "git-remote-foo"),
             $"#!/bin/sh\necho owned > {marker.Replace('\\', '/')}\nexit 1\n");
         var repo = Path.Combine(_root, "hostile-helper");
@@ -183,6 +191,15 @@ public sealed class GoneFetchSecurityTests : IAsyncLifetime
         try
         {
             Environment.SetEnvironmentVariable("PATH", fakeBin + Path.PathSeparator + originalPath);
+
+            // Positive control: with the same PATH, plain git does run the
+            // `git-remote-foo` helper. The script exits 1, so `ls-remote`
+            // fails at once without touching the network. Without this proof
+            // a helper git cannot run would make the assertion below pass
+            // vacuously. Kept inside this try/finally: PATH is process-wide.
+            await Assert.ThrowsAsync<InvalidOperationException>(() => RunGitAsync(repo, "ls-remote", "origin"));
+            Assert.True(File.Exists(marker), "plain `git ls-remote` did not run the planted git-remote-foo helper");
+            File.Delete(marker);
 
             var fetch = await _sut.FetchPruneAsync(repo);
 

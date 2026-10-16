@@ -63,10 +63,10 @@ internal static class TrashRestoreHelper
         foreach (var entry in entries)
         {
             table.AddRow(
-                $"[blue]{Markup.Escape(entry.BranchName)}[/]",
-                Markup.Escape(ShortSha(entry.CommitSha)),
-                Markup.Escape(entry.DeletedAtUtc.UtcDateTime.ToString("yyyy-MM-dd HH:mm")),
-                $"[grey]{Markup.Escape(entry.Id[..8])}…[/]");
+                $"[blue]{TerminalText.Markup(entry.BranchName)}[/]",
+                TerminalText.Markup(ShortSha(entry.CommitSha)),
+                TerminalText.Markup(entry.DeletedAtUtc.UtcDateTime.ToString("yyyy-MM-dd HH:mm")),
+                $"[grey]{TerminalText.Markup(entry.Id[..8])}…[/]");
         }
 
         return table;
