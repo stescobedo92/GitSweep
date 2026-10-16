@@ -79,50 +79,167 @@ public sealed class GitSweepConfigService : IGitSweepConfigService
 
         // Lectura acotada: sin seguir enlaces, sin abrir longitud 0 (una FIFO
         // bloquearía open(2) para siempre) y sin leer más de límite + 1 bytes.
+        // Los mensajes no repiten «refusing to clean»: clean ya lo antepone.
         var read = await BoundedFileReader.ReadAsync(configPath, MaxConfigBytes, ct);
         switch (read.Status)
         {
             case BoundedReadStatus.Link:
                 throw new InvalidOperationException($".gitsweep.json at '{configPath}' is a symbolic link; refusing to read it.");
             case BoundedReadStatus.Empty:
-                throw new InvalidOperationException(".gitsweep.json is empty; refusing to clean without verified protection.");
+                throw new InvalidOperationException(EmptyMessage);
             case BoundedReadStatus.TooLarge:
                 throw new InvalidOperationException($".gitsweep.json exceeds the {MaxConfigBytes} byte limit; refusing to read it.");
             case BoundedReadStatus.Ok:
                 break;
             default:
-                throw new InvalidOperationException(".gitsweep.json could not be read; refusing to clean without verified protection.");
+                throw new InvalidOperationException(".gitsweep.json could not be read.");
         }
+
+        byte[] json;
+        using (var content = read.Content!)
+        {
+            json = content.ToArray();
+        }
+
+        // Un BOM UTF-8 (editores de Windows) se acepta, como antes.
+        ReadOnlySpan<byte> utf8 = json;
+        if (utf8.StartsWith(Utf8Bom))
+            utf8 = utf8[Utf8Bom.Length..];
+
+        // I4: antes se informaba todo como «no es JSON válido», también un JSON
+        // válido con una propiedad desconocida (`$schema`) o mal escrita. Se
+        // distingue la categoría y se da la línea, pero nunca contenido del
+        // fichero (ni siquiera el nombre de la propiedad, que podría ser un
+        // secreto pegado por error), ni la excepción interna, que lo citaría.
+        var structureError = FindStructureError(utf8);
+        if (structureError is not null)
+            throw new InvalidOperationException(structureError);
 
         GitSweepConfigDto? dto;
         try
         {
-            using var content = read.Content!;
-            dto = JsonSerializer.Deserialize<GitSweepConfigDto>(content, JsonOptions);
+            dto = JsonSerializer.Deserialize<GitSweepConfigDto>(utf8, JsonOptions);
         }
         catch (JsonException ex)
         {
-            // Sin filtrar contenido ni línea del fichero: solo el tipo de error.
-            throw new InvalidOperationException($".gitsweep.json is not valid JSON ({ex.GetType().Name}); refusing to clean without verified protection.", ex);
+            // La sintaxis y los nombres ya se comprobaron: queda un valor del
+            // tipo equivocado (p. ej. "protectedBranches": "release/*").
+            throw new InvalidOperationException(
+                $".gitsweep.json has a value of the wrong type{FormatLocation(ex.LineNumber, ex.BytePositionInLine)}: " +
+                "protectedBranches must be an array of strings (or null), excludeCurrentBranch and excludeWorktreeBranches must be true or false.");
         }
 
         if (dto is null)
-            throw new InvalidOperationException(".gitsweep.json is empty; refusing to clean without verified protection.");
+            throw new InvalidOperationException(EmptyMessage);
 
         // Ausente, nula o vacía = sin patrones extra (los integrados siempre aplican).
         var patterns = dto.ProtectedBranches ?? [];
         if (patterns.Count > GitSweepConfig.MaxProtectedPatterns)
-            throw new InvalidOperationException($".gitsweep.json declares more than {GitSweepConfig.MaxProtectedPatterns} protected patterns; refusing to clean.");
-        foreach (var pattern in patterns)
+            throw new InvalidOperationException($".gitsweep.json declares more than {GitSweepConfig.MaxProtectedPatterns} protected patterns.");
+        for (var index = 0; index < patterns.Count; index++)
         {
-            if (!BranchGlobMatcher.IsValidPattern(pattern))
-                throw new InvalidOperationException($".gitsweep.json contains an invalid protected branch pattern; refusing to clean.");
+            if (!BranchGlobMatcher.IsValidPattern(patterns[index]))
+                throw new InvalidOperationException(
+                    $".gitsweep.json contains an invalid protected branch pattern (entry {index + 1} of protectedBranches; patterns cannot be empty or contain whitespace, control characters, ~ ^ : [ ] \\, .. or @{{).");
         }
 
         return new GitSweepConfig(
             patterns.Select(p => p.Trim()).ToList(),
             dto.ExcludeCurrentBranch ?? true,
             dto.ExcludeWorktreeBranches ?? true);
+    }
+
+    private const string EmptyMessage = ".gitsweep.json is empty; it must contain a JSON object such as {}.";
+
+    private const string AllowedPropertiesText = "protectedBranches, excludeCurrentBranch and excludeWorktreeBranches";
+
+    // Nombres admitidos, sin distinguir mayúsculas (como el deserializador).
+    private static readonly HashSet<string> AllowedProperties =
+        new(["protectedBranches", "excludeCurrentBranch", "excludeWorktreeBranches"], StringComparer.OrdinalIgnoreCase);
+
+    private static ReadOnlySpan<byte> Utf8Bom => [0xEF, 0xBB, 0xBF];
+
+    /// <summary>
+    /// Comprueba la sintaxis y las propiedades de primer nivel y devuelve el
+    /// mensaje (en inglés, con categoría y línea, sin contenido del fichero)
+    /// del primer problema, o <c>null</c> si no hay ninguno. Las mismas reglas
+    /// que el deserializador estricto: sin comentarios ni comas finales,
+    /// profundidad acotada, solo las tres propiedades conocidas y cada una
+    /// una sola vez (las variantes de mayúsculas cuentan como repetición).
+    /// </summary>
+    private static string? FindStructureError(ReadOnlySpan<byte> utf8)
+    {
+        var options = new JsonReaderOptions
+        {
+            AllowTrailingCommas = false,
+            CommentHandling = JsonCommentHandling.Disallow,
+            MaxDepth = 32
+        };
+
+        // Una sola envoltura: cualquier JsonException (sintaxis, profundidad,
+        // o UTF-8 inválido al leer un nombre de propiedad, RR-8) se traduce a
+        // la categoría «no es JSON válido», con la línea si la hay y sin texto
+        // del framework.
+        try
+        {
+            // 1. Sintaxis de todo el documento.
+            var syntax = new Utf8JsonReader(utf8, options);
+            while (syntax.Read())
+            {
+            }
+
+            // 2. Raíz y nombres de propiedad de primer nivel.
+            var reader = new Utf8JsonReader(utf8, options);
+            reader.Read();
+            if (reader.TokenType == JsonTokenType.Null)
+                return EmptyMessage;
+            if (reader.TokenType != JsonTokenType.StartObject)
+                return ".gitsweep.json must contain a JSON object, for example {\"protectedBranches\": []}.";
+
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            while (reader.Read() && reader.TokenType == JsonTokenType.PropertyName)
+            {
+                // Posición antes de transcodificar: si el nombre lleva UTF-8
+                // inválido, GetString lanza InvalidOperationException (no
+                // JsonException; M-1/RR-8) y se mapea a «no es JSON válido» con
+                // la línea, sin el texto del framework.
+                var location = FormatLocation(utf8, reader.TokenStartIndex);
+                string name;
+                try
+                {
+                    name = reader.GetString() ?? string.Empty;
+                }
+                catch (InvalidOperationException)
+                {
+                    return $".gitsweep.json is not valid JSON{location}; the file must be strict JSON (no comments or trailing commas).";
+                }
+
+                if (!AllowedProperties.Contains(name))
+                    return $".gitsweep.json has an unknown property{location}; the allowed properties are {AllowedPropertiesText}.";
+                if (!seen.Add(name))
+                    return $".gitsweep.json repeats a property{location}; each property may appear only once (names that differ only in case count as the same property).";
+                reader.Skip();
+            }
+
+            return null;
+        }
+        catch (JsonException ex)
+        {
+            return $".gitsweep.json is not valid JSON{FormatLocation(ex.LineNumber, ex.BytePositionInLine)}; the file must be strict JSON (no comments or trailing commas).";
+        }
+    }
+
+    // Posición de un error del lector (base 0) como « at line N, position M».
+    private static string FormatLocation(long? lineNumber, long? bytePositionInLine) =>
+        lineNumber is null
+            ? string.Empty
+            : $" at line {lineNumber.Value + 1}" + (bytePositionInLine is null ? string.Empty : $", position {bytePositionInLine.Value + 1}");
+
+    // Línea (base 1) del byte en tokenStart, contando saltos de línea.
+    private static string FormatLocation(ReadOnlySpan<byte> utf8, long tokenStart)
+    {
+        var before = utf8[..(int)Math.Min(tokenStart, utf8.Length)];
+        return $" at line {before.Count((byte)'\n') + 1}";
     }
 
     private sealed class GitSweepConfigDto

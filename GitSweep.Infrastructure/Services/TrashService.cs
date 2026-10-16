@@ -88,38 +88,69 @@ public sealed class TrashService : ITrashService
             DateTimeOffset.UtcNow,
             batchId);
 
+        // Durable safety net against data loss: a keep-ref
+        // refs/gitsweep/trash/<id> pins the commit so `git gc` can never prune
+        // it while the entry lives, independently of anything a hostile ref
+        // store does to the branch during `git branch -d`. Create it BEFORE
+        // the JSON record, fail closed if it cannot be created or verified: a
+        // deleted branch must never end up with a record but no gc-proof ref
+        // (and the caller never deletes the branch when SaveAsync throws).
+        // The keep-ref is refused when a linked directory could redirect it
+        // into another ref namespace, or when git also sees it under another
+        // name: there a fetch --prune could delete it, and the reachability
+        // check would have counted it as "another ref".
+        var (created, reason) = await _gitService.CreateTrashKeepRefAsync(path, entry.Id, entry.CommitSha, ct);
+        if (!created)
+        {
+            var detail = string.IsNullOrWhiteSpace(reason) ? string.Empty : $": {reason.Trim().TrimEnd('.')}";
+            throw new InvalidOperationException(
+                $"Could not create the GitSweep keep-ref for '{branchName}'{detail}. Refusing to delete the branch without a gc-proof reference to its commit.");
+        }
+
         var finalPath = GetContainedPath(trashDirectory, entry.Id + ".json");
         var tempPath = GetContainedPath(trashDirectory, $".{entry.Id}.{Guid.NewGuid():N}.tmp");
         try
         {
-            await using (var stream = new FileStream(
-                tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None,
-                bufferSize: 4096, useAsync: true))
-            {
-                await JsonSerializer.SerializeAsync(stream, entry, JsonOptions, ct);
-                await stream.FlushAsync(ct);
-                // The entry must survive a crash between save and delete:
-                // flush to disk, not just to the OS page cache.
-                stream.Flush(flushToDisk: true);
-            }
-
-            // Same-directory move without overwrite: atomic on the same volume
-            // and refuses to clobber an existing entry.
-            File.Move(tempPath, finalPath, overwrite: false);
-        }
-        finally
-        {
             try
             {
-                if (File.Exists(tempPath))
+                await using (var stream = new FileStream(
+                    tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None,
+                    bufferSize: 4096, useAsync: true))
                 {
-                    File.Delete(tempPath);
+                    await JsonSerializer.SerializeAsync(stream, entry, JsonOptions, ct);
+                    await stream.FlushAsync(ct);
+                    // The entry must survive a crash between save and delete:
+                    // flush to disk, not just to the OS page cache.
+                    stream.Flush(flushToDisk: true);
+                }
+
+                // Same-directory move without overwrite: atomic on the same volume
+                // and refuses to clobber an existing entry.
+                File.Move(tempPath, finalPath, overwrite: false);
+            }
+            finally
+            {
+                try
+                {
+                    if (File.Exists(tempPath))
+                    {
+                        File.Delete(tempPath);
+                    }
+                }
+                catch (Exception)
+                {
+                    // Best effort only: a leftover *.tmp is ignored by ListAsync.
                 }
             }
-            catch (Exception)
-            {
-                // Best effort only: a leftover *.tmp is ignored by ListAsync.
-            }
+        }
+        catch
+        {
+            // The JSON record could not be written: remove the keep-ref just
+            // created so a failed save leaves neither. Best-effort; a leftover
+            // keep-ref only pins a commit of the branch that was not deleted.
+            try { await _gitService.DeleteTrashKeepRefAsync(path, entry.Id, entry.CommitSha, ct); }
+            catch (Exception) { /* best effort */ }
+            throw;
         }
 
         return entry;
@@ -186,8 +217,23 @@ public sealed class TrashService : ITrashService
             return false;
         }
 
+        // Read the entry first so the keep-ref can be removed by its exact SHA
+        // (compare-and-delete). RemoveAsync only runs once the branch is back
+        // (rollback, restore, undo), so dropping the keep-ref is pure cleanup.
+        var entry = await TryReadEntryAsync(filePath, ct);
+
         ct.ThrowIfCancellationRequested();
         File.Delete(filePath);
+
+        // Delete the record first, the keep-ref second: the gc-proof ref must
+        // never predecease its record. A missing or mismatched keep-ref is
+        // left untouched and never blocks the restore (best-effort).
+        if (entry is not null)
+        {
+            try { await _gitService.DeleteTrashKeepRefAsync(path, entry.Id, entry.CommitSha, ct); }
+            catch (Exception) { /* best effort: a leftover keep-ref only pins a commit */ }
+        }
+
         return true;
     }
 

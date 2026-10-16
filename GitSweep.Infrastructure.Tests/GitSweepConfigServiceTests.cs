@@ -230,6 +230,71 @@ public sealed class GitSweepConfigServiceTests : IDisposable
         Assert.Contains("is empty", ex.Message);
     }
 
+    // I4 (final-review.md): every strict failure used to read "is not valid
+    // JSON", even for valid JSON with an unknown key such as $schema. The
+    // message now names the category and the line, never the file content
+    // (not even the offending property name), never repeats clean's
+    // "refusing to clean" prefix, and carries no inner exception that would
+    // quote the content.
+    [Theory]
+    [InlineData("{\n  \"$schema\": \"https://example/schema.json\",\n  \"protectedBranches\": [\"release/*\"]\n}", "has an unknown property at line 2")]
+    [InlineData("{\n  \"protectedBranches\": [\"release/*\"],\n  \"protected_branches\": [\"release/*\"]\n}", "has an unknown property at line 3")]
+    [InlineData("{\n  \"protectedBranches\": [\"release/*\"],\n\n  \"ProtectedBranches\": []\n}", "repeats a property at line 4")]
+    [InlineData("{\n  \"protectedBranches\": \"release/*\"\n}", "has a value of the wrong type at line 2")]
+    [InlineData("{\n  \"excludeCurrentBranch\": \"no\"\n}", "has a value of the wrong type at line 2")]
+    [InlineData("{\n  \"protectedBranches\": [\"release/*\",]\n}", "is not valid JSON at line 2")]
+    [InlineData("{\n  // release branches\n  \"protectedBranches\": [\"release/*\"]\n}", "is not valid JSON at line 2")]
+    [InlineData("[\"release/*\"]", "must contain a JSON object")]
+    [InlineData("null", "is empty")]
+    public async Task LoadAsync_failure_names_the_problem_and_its_line_without_quoting_the_file(string json, string expected)
+    {
+        await WriteConfigAsync(json);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => _sut.LoadAsync(_dir));
+
+        Assert.Contains(expected, ex.Message);
+        Assert.DoesNotContain("refusing to clean", ex.Message);
+        Assert.DoesNotContain("$schema", ex.Message);
+        Assert.DoesNotContain("protected_branches", ex.Message);
+        Assert.DoesNotContain("ProtectedBranches", ex.Message);
+        Assert.DoesNotContain("release", ex.Message);
+        Assert.Null(ex.InnerException);
+        if (expected.Contains("unknown property", StringComparison.Ordinal))
+        {
+            Assert.Contains("the allowed properties are protectedBranches, excludeCurrentBranch and excludeWorktreeBranches", ex.Message);
+        }
+    }
+
+    // M-1 / RR-8: invalid UTF-8 in a property name must map to the syntax
+    // category with its line, never leak the framework's "Cannot transcode …"
+    // text (System.Text.Json throws InvalidOperationException there, not
+    // JsonException).
+    [Fact]
+    public async Task LoadAsync_invalid_utf8_in_a_property_name_maps_to_the_syntax_category()
+    {
+        // {\n  "pro<0xFF>tected": []\n}  — the bad byte is on line 2.
+        byte[] bytes = [.. Encoding.ASCII.GetBytes("{\n  \"pro"), 0xFF, .. Encoding.ASCII.GetBytes("tected\": []\n}")];
+        await File.WriteAllBytesAsync(Path.Combine(_dir, GitSweepConfig.FileName), bytes);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => _sut.LoadAsync(_dir));
+
+        Assert.Contains("is not valid JSON at line 2", ex.Message);
+        Assert.DoesNotContain("transcode", ex.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Null(ex.InnerException);
+    }
+
+    [Fact]
+    public async Task LoadAsync_invalid_pattern_names_its_entry_without_quoting_it()
+    {
+        await WriteConfigAsync("""{"protectedBranches":["release/*","bad pattern"]}""");
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => _sut.LoadAsync(_dir));
+
+        Assert.Contains("entry 2 of protectedBranches", ex.Message);
+        Assert.DoesNotContain("bad pattern", ex.Message);
+        Assert.DoesNotContain("refusing to clean", ex.Message);
+    }
+
     [Fact]
     public async Task GetConfigFilePathAsync_points_to_gitsweep_json()
     {

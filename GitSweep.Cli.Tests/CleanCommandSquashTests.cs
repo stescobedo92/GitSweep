@@ -32,8 +32,8 @@ public sealed class CleanCommandSquashTests
             .Returns("main");
         _gitService.GetLocalBranchesAsync("/some/repo", "main", Arg.Any<CancellationToken>())
             .Returns(branches);
-        _analyzer.IdentifyStaleBranches(branches, 6).Returns([]);
-        _analyzer.IdentifyMergedBranches(branches).Returns([squash]);
+        _analyzer.IdentifyStaleBranches(AnalyzerInput.Matching(branches), 6).Returns([]);
+        _analyzer.IdentifyMergedBranches(AnalyzerInput.Matching(branches)).Returns([squash]);
 
         var result = await command.ExecuteForTestAsync(CreateContext(), settings, CancellationToken.None);
 

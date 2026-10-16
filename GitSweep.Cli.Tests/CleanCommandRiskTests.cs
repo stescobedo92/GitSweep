@@ -50,8 +50,8 @@ public sealed class CleanCommandRiskTests
         _gitService.IsGitRepositoryAsync("/some/repo", Arg.Any<CancellationToken>()).Returns(true);
         _gitService.GetDefaultBranchNameAsync("/some/repo", Arg.Any<CancellationToken>()).Returns("main");
         _gitService.GetLocalBranchesAsync("/some/repo", "main", Arg.Any<CancellationToken>()).Returns(branches);
-        _analyzer.IdentifyStaleBranches(branches, 6).Returns([stale]);
-        _analyzer.IdentifyMergedBranches(branches).Returns([safe]);
+        _analyzer.IdentifyStaleBranches(AnalyzerInput.Matching(branches), 6).Returns([stale]);
+        _analyzer.IdentifyMergedBranches(AnalyzerInput.Matching(branches)).Returns([safe]);
         _gitService.GetBranchRiskSignalsAsync("/some/repo", "main", "feature/merged", Arg.Any<CancellationToken>())
             .Returns(new BranchRiskSignals(0, 0, true, true));
         _gitService.GetBranchRiskSignalsAsync("/some/repo", "main", "feature/stale", Arg.Any<CancellationToken>())
@@ -83,8 +83,8 @@ public sealed class CleanCommandRiskTests
         _gitService.IsGitRepositoryAsync("/some/repo", Arg.Any<CancellationToken>()).Returns(true);
         _gitService.GetDefaultBranchNameAsync("/some/repo", Arg.Any<CancellationToken>()).Returns("main");
         _gitService.GetLocalBranchesAsync("/some/repo", "main", Arg.Any<CancellationToken>()).Returns(branches);
-        _analyzer.IdentifyStaleBranches(branches, 6).Returns([]);
-        _analyzer.IdentifyMergedBranches(branches).Returns([merged]);
+        _analyzer.IdentifyStaleBranches(AnalyzerInput.Matching(branches), 6).Returns([]);
+        _analyzer.IdentifyMergedBranches(AnalyzerInput.Matching(branches)).Returns([merged]);
         // NSubstitute devolvería null; el comando debe degradar a desconocido/revisar.
         _gitService.GetBranchRiskSignalsAsync("/some/repo", "main", "feature/merged", Arg.Any<CancellationToken>())
             .Returns(BranchRiskSignals.Unknown);

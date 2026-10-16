@@ -400,6 +400,24 @@ public sealed class GitCommandLimitsTests : IAsyncLifetime
         Assert.Equal("git branch output exceeded the 1-character limit.", message);
     }
 
+    // N-1: CreateBranchAsync runs a `for-each-ref refs/heads/` listing first
+    // (the case-variant check). A limit failure there must be reported as
+    // Success == false, not thrown, so restore keeps its record and keep-ref
+    // and the batch continues. (The stderr-cap test above exercises the later
+    // `branch` command; this one caps stdout, which the listing writes.)
+    [Fact]
+    public async Task CreateBranch_hitting_a_stdout_limit_on_the_case_variant_listing_reports_failure_not_a_throw()
+    {
+        var tip = (await RunGitAsync(_repoPath, "rev-parse", "HEAD")).Trim();
+        var sut = new GitRepositoryService(new GitCommandLimits(Generous, Generous, 1, GenerousChars));
+
+        var (success, message) = await sut.CreateBranchAsync(_repoPath, "restored", tip);
+
+        Assert.False(success);
+        Assert.Contains("for-each-ref", message);
+        Assert.Contains("exceeded the 1-character limit", message);
+    }
+
     private Task<(int ExitCode, string Output, string Error)> RunAsync(
         string[] arguments,
         TimeSpan? timeout = null,

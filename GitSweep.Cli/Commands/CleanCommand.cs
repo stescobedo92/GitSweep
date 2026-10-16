@@ -264,8 +264,6 @@ public sealed class CleanCommand : AsyncCommand<CleanCommand.Settings>
         // antes de cualquier análisis/borrado.
         var protectedBranches = _protectionService.FilterProtected(
             allBranches, protectionConfig, currentBranch, worktreeBranches, out var unprotectedBranches);
-        if (protectedBranches.Count == 0)
-            unprotectedBranches = allBranches;
         WriteProtectionSummary(protectedBranches, protectionConfig);
 
         var staleBranches = _analyzer.IdentifyStaleBranches(unprotectedBranches, staleAge).ToList();
@@ -435,7 +433,14 @@ public sealed class CleanCommand : AsyncCommand<CleanCommand.Settings>
             _console.MarkupLine($"[red]Failed to delete branch '[blue]{TerminalText.Markup(failure.BranchName)}[/]':[/] {TerminalText.Markup(reason, allowNewlines: true)}");
             if (reason.Contains("not fully merged", StringComparison.OrdinalIgnoreCase))
             {
-                _console.MarkupLine($"  [grey]Tip: Use [blue]git branch -D {TerminalText.Markup(failure.BranchName)}[/] to force-delete this branch if you no longer need its changes.[/]");
+                // I1: the tip is a command users paste into a shell, and a
+                // branch name comes from the repository: `x;touch${IFS}pwned`
+                // is a valid name. Only a name made of characters no shell
+                // interprets is spelled out (after `--`); any other name is
+                // left for the user to quote.
+                _console.MarkupLine(IsShellSafeBranchName(failure.BranchName)
+                    ? $"  [grey]Tip: Use [blue]git branch -D -- {TerminalText.Markup(failure.BranchName)}[/] to force-delete this branch if you no longer need its changes.[/]"
+                    : "  [grey]Tip: To force-delete this branch if you no longer need its changes, run [blue]git branch -D -- <name>[/] with the branch name quoted for your shell (the name contains characters a shell would interpret).[/]");
             }
         }
 
@@ -455,6 +460,13 @@ public sealed class CleanCommand : AsyncCommand<CleanCommand.Settings>
 
         return failures.Count == 0 ? 0 : 1;
     }
+
+    // Letters, digits and . _ / - only: no shell (sh, bash, PowerShell, cmd)
+    // gives any of them a meaning inside a word, and a valid branch name
+    // never starts with '-'.
+    internal static bool IsShellSafeBranchName(string branchName) =>
+        branchName.Length > 0 &&
+        branchName.All(c => char.IsAsciiLetterOrDigit(c) || c is '.' or '_' or '/' or '-');
 
     /// <summary>
     /// Best-effort removal of a trash entry whose branch was not deleted:

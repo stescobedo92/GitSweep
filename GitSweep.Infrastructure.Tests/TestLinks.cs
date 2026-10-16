@@ -45,6 +45,19 @@ internal static class TestLinks
         }
     }
 
+    /// <summary>
+    /// Creates a Windows directory junction (never a symlink): the link kind
+    /// any unprivileged user can create, and the one a hostile archive
+    /// would ship. Throws when it cannot be created or off Windows.
+    /// </summary>
+    public static void CreateJunction(string linkPath, string targetPath)
+    {
+        if (!OperatingSystem.IsWindows() || !TryCreateJunction(linkPath, targetPath))
+        {
+            throw new IOException($"Cannot create a junction at '{linkPath}'.");
+        }
+    }
+
     private static bool TryCreateJunction(string linkPath, string targetPath)
     {
         try
@@ -146,6 +159,56 @@ internal sealed class DirectoryLinkFactAttribute : FactAttribute
         if (reason is not null)
         {
             Skip = "Cannot create directory symbolic links or junctions on this machine (" + reason + ").";
+        }
+    }
+}
+
+/// <summary>
+/// A <c>[Theory]</c> that needs directory links; skipped like
+/// <see cref="DirectoryLinkFactAttribute"/> when none can be created.
+/// </summary>
+internal sealed class DirectoryLinkTheoryAttribute : TheoryAttribute
+{
+    public DirectoryLinkTheoryAttribute()
+    {
+        var reason = TestLinks.DirectoryLinkUnavailableReason;
+        if (reason is not null)
+        {
+            Skip = "Cannot create directory symbolic links or junctions on this machine (" + reason + ").";
+        }
+    }
+}
+
+/// <summary>
+/// A <c>[Fact]</c> that needs a case-sensitive file system (so that
+/// <c>Feature</c> and <c>feature</c> can coexist). Skipped, with the reason,
+/// on a case-insensitive file system (Windows/macOS), where the scenario the
+/// test guards cannot be built with loose refs.
+/// </summary>
+internal sealed class CaseSensitiveFileSystemFactAttribute : FactAttribute
+{
+    private static readonly Lazy<bool> CaseSensitive = new(Probe);
+
+    public CaseSensitiveFileSystemFactAttribute()
+    {
+        if (!CaseSensitive.Value)
+        {
+            Skip = "Requires a case-sensitive file system (Feature vs feature cannot coexist here).";
+        }
+    }
+
+    private static bool Probe()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "GitSweepCaseProbe", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            File.WriteAllText(Path.Combine(dir, "probe"), "x");
+            return !File.Exists(Path.Combine(dir, "PROBE"));
+        }
+        finally
+        {
+            try { Directory.Delete(dir, recursive: true); } catch (Exception) { }
         }
     }
 }

@@ -76,11 +76,28 @@ public interface IGitRepositoryService
     Task<bool> BranchExistsAsync(string path, string branchName, CancellationToken ct = default);
 
     /// <summary>
-    /// Creates a local branch pointing at <paramref name="commitSha"/> with
-    /// plain <c>git branch</c> (never <c>-f</c>/<c>-D</c>): it fails instead
-    /// of overwriting when the branch already exists. Both the name and the
-    /// SHA are validated before git is invoked.
+    /// Creates a local branch at <paramref name="commitSha"/> with plain
+    /// <c>git branch</c> (never <c>-f</c>/<c>-D</c>). Both the name and the SHA
+    /// are validated before git is invoked.
     /// </summary>
+    /// <remarks>
+    /// Contract callers rely on:
+    /// <list type="bullet">
+    /// <item><c>Success</c> is <see langword="true"/> only when the branch now
+    /// points at exactly <paramref name="commitSha"/>. The start point is
+    /// passed as <c>&lt;sha&gt;^{commit}</c>, which no ref can be named, so a
+    /// tag or ref named like the SHA can never redirect it; the resulting tip
+    /// is re-read and compared. On a mismatch <c>Success</c> is
+    /// <see langword="false"/> (git may have created the branch at another
+    /// object), so the caller must keep its trash record and keep-ref.</item>
+    /// <item>An existing branch is never overwritten: git fails when the exact
+    /// name exists, and GitSweep additionally refuses a name that differs from
+    /// an existing branch only in letter case (on a case-insensitive file
+    /// system both would be the same ref).</item>
+    /// <item>A limit failure is reported as <c>Success == false</c>, never as a
+    /// throw, so a restore keeps its record.</item>
+    /// </list>
+    /// </remarks>
     Task<(bool Success, string ErrorMessage)> CreateBranchAsync(string path, string branchName, string commitSha, CancellationToken ct = default);
 
     /// <summary>Rama actualmente en checkout en <paramref name="path"/> (<c>git branch --show-current</c>), o <see langword="null"/> si HEAD está detached o no es un repo.</summary>
@@ -91,4 +108,39 @@ public interface IGitRepositoryService
 
     /// <summary>Raíz del working tree (<c>git rev-parse --show-toplevel</c>), o <see langword="null"/> si no es un repo.</summary>
     Task<string?> GetRepositoryRootAsync(string path, CancellationToken ct = default);
+
+    /// <summary>
+    /// Crea la keep-ref <c>refs/gitsweep/trash/&lt;trashId&gt;</c> apuntando a
+    /// <paramref name="commitSha"/>, con semántica de solo-creación, y verifica
+    /// que resuelve exactamente a ese SHA y que git no la ve con ningún otro
+    /// nombre. Es la red de seguridad contra la pérdida de datos: mientras
+    /// exista, <c>git gc</c> no puede podar el commit de la rama borrada, pase
+    /// lo que pase con el resto del almacén de refs.
+    /// </summary>
+    /// <remarks>
+    /// Antes de crearla exige que <c>refs</c> sea un directorio real y que
+    /// <c>refs/gitsweep</c> y <c>refs/gitsweep/trash</c> no existan o sean
+    /// directorios reales (nunca enlaces simbólicos, junctions u otros puntos
+    /// de reanálisis), para que ningún enlace la desvíe a otro espacio de
+    /// nombres (<c>refs/remotes</c>, <c>refs/tags</c>...) donde un
+    /// <c>fetch --prune</c> la borraría. Después de crearla rechaza cualquier
+    /// otro nombre de ref cuyo último componente sea el id (un alias del mismo
+    /// fichero) y la quita con comparar-y-borrar. Devuelve
+    /// <c>(false, motivo en inglés)</c> si no se pudo crear o verificar; el
+    /// llamador debe entonces abortar el guardado para no borrar la rama. Un
+    /// fallo por límite lanza <see cref="GitCommandLimitException"/> (también
+    /// aborta el guardado).
+    /// </remarks>
+    Task<(bool Success, string ErrorMessage)> CreateTrashKeepRefAsync(string path, string trashId, string commitSha, CancellationToken ct = default);
+
+    /// <summary>
+    /// Borra la keep-ref <c>refs/gitsweep/trash/&lt;trashId&gt;</c> solo si aún
+    /// apunta a <paramref name="commitSha"/> (comparar-y-borrar): nunca borra una
+    /// ref cuyo valor difiera, y una ref ausente se trata como ya borrada. Es
+    /// limpieza best-effort tras recrear/restaurar la rama: nunca lanza y
+    /// devuelve <see langword="false"/> ante cualquier fallo, para no bloquear la
+    /// restauración. Una keep-ref que quede por un fallo solo fija el commit, lo
+    /// cual es inocuo.
+    /// </summary>
+    Task<bool> DeleteTrashKeepRefAsync(string path, string trashId, string commitSha, CancellationToken ct = default);
 }

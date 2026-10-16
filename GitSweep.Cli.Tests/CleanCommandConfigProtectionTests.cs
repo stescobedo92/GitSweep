@@ -95,4 +95,23 @@ public sealed class CleanCommandConfigProtectionTests : IDisposable
         await _gitService.DidNotReceive().DeleteBranchAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<CancellationToken>());
         await _gitService.DidNotReceive().GetLocalBranchesAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<CancellationToken>());
     }
+
+    [Fact]
+    public async Task Unknown_property_error_names_its_line_and_says_refusing_to_clean_once()
+    {
+        // I4: valid JSON with an editor's $schema key used to be reported as
+        // "not valid JSON" with "refusing to clean" twice and no location.
+        await File.WriteAllTextAsync(Path.Combine(_repo, GitSweepConfig.FileName),
+            "{\n  \"$schema\": \"https://example/schema.json\",\n  \"protectedBranches\": [\"release/*\"]\n}");
+        SetupRepo(MergedBranches());
+        var console = new TestConsole().Width(400);
+
+        var result = await CreateCommand(console).ExecuteForTestAsync(CreateContext(), AutomatedSettings(_repo), CancellationToken.None);
+
+        Assert.Equal(1, result);
+        Assert.Contains("has an unknown property at line 2", console.Output);
+        Assert.DoesNotContain("not valid JSON", console.Output);
+        Assert.Single(System.Text.RegularExpressions.Regex.Matches(console.Output, "refusing to clean"));
+        await _gitService.DidNotReceive().DeleteBranchAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<CancellationToken>());
+    }
 }

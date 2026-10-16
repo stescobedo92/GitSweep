@@ -165,7 +165,12 @@ public sealed class TerminalOutputSanitizationTests
         Assert.Equal(1, result);
         AssertNoRawControlSequences(console.Output);
         Assert.Contains(@"Failed to delete branch 'feature/\u202Eexe.txt': error: the branch is not fully merged\x1B]52;c;cHduZWQ=\x07\x1B[2J", console.Output, StringComparison.Ordinal);
-        Assert.Contains(@"git branch -D feature/\u202Eexe.txt", console.Output, StringComparison.Ordinal);
+        // I1: the -D tip is a pasteable shell command, so a name with any
+        // character outside [A-Za-z0-9._/-] (here U+202E) is never spelled
+        // out there, escaped or not; the generic tip is shown instead.
+        Assert.Contains("git branch -D -- <name>", console.Output, StringComparison.Ordinal);
+        Assert.DoesNotContain(@"git branch -D feature/", console.Output, StringComparison.Ordinal);
+        Assert.DoesNotContain(@"git branch -D -- feature/", console.Output, StringComparison.Ordinal);
         Assert.Contains(@"Deleting feature/\u202Eexe.txt", console.Output, StringComparison.Ordinal);
     }
 

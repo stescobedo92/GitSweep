@@ -106,4 +106,32 @@ public sealed class CleanCommandLimitFailureTests
             Repo, "feature/merged", Sha, Arg.Any<Guid>(), Arg.Any<CancellationToken>());
         await _trashService.DidNotReceive().RemoveAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<CancellationToken>());
     }
+
+    [Fact]
+    public async Task Delete_whose_commits_could_not_be_kept_reachable_keeps_the_trash_entry_and_stops()
+    {
+        // T4-01: `git branch -d` deleted the branch, no other ref contains
+        // its tip and recreating it failed. The trash entry may now be the
+        // only record of the SHA: it must survive (no rollback) and clean
+        // must stop, with the error reaching the global handler.
+        var branches = new List<BranchInfo>
+        {
+            new("feature/merged", DateTime.UtcNow, true),
+            new("feature/next", DateTime.UtcNow, true)
+        };
+        SetupMergedBranch();
+        _gitService.GetLocalBranchesAsync(Repo, "main", Arg.Any<CancellationToken>()).Returns(branches);
+        _gitService.DeleteBranchAsync(Repo, "feature/merged", Arg.Any<CancellationToken>())
+            .ThrowsAsync(new BranchDeletionVerificationException(
+                $"Branch 'feature/merged' was deleted, but no other branch, remote-tracking branch or tag contains its tip {Sha} and it could not be recreated."));
+        var command = CreateCommand(new TestConsole());
+
+        await Assert.ThrowsAsync<BranchDeletionVerificationException>(
+            () => command.ExecuteForTestAsync(CreateContext(), DeleteAll(), CancellationToken.None));
+
+        await _trashService.Received(1).SaveAsync(
+            Repo, "feature/merged", Sha, Arg.Any<Guid>(), Arg.Any<CancellationToken>());
+        await _trashService.DidNotReceive().RemoveAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<CancellationToken>());
+        await _gitService.DidNotReceive().DeleteBranchAsync(Repo, "feature/next", Arg.Any<CancellationToken>());
+    }
 }

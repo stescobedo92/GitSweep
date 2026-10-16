@@ -112,8 +112,8 @@ public sealed class CleanCommandTests
             .Returns("main");
         _gitService.GetLocalBranchesAsync("/some/repo", "main", Arg.Any<CancellationToken>())
             .Returns(branches);
-        _analyzer.IdentifyStaleBranches(branches, 6).Returns([]);
-        _analyzer.IdentifyMergedBranches(branches).Returns([]);
+        _analyzer.IdentifyStaleBranches(AnalyzerInput.Matching(branches), 6).Returns([]);
+        _analyzer.IdentifyMergedBranches(AnalyzerInput.Matching(branches)).Returns([]);
 
         var result = await command.ExecuteForTestAsync(CreateContext(), settings, CancellationToken.None);
 
@@ -140,8 +140,8 @@ public sealed class CleanCommandTests
             .Returns("main");
         _gitService.GetLocalBranchesAsync("/some/repo", "main", Arg.Any<CancellationToken>())
             .Returns(branches);
-        _analyzer.IdentifyStaleBranches(branches, 6).Returns(staleBranches);
-        _analyzer.IdentifyMergedBranches(branches).Returns([]);
+        _analyzer.IdentifyStaleBranches(AnalyzerInput.Matching(branches), 6).Returns(staleBranches);
+        _analyzer.IdentifyMergedBranches(AnalyzerInput.Matching(branches)).Returns([]);
 
         var result = await command.ExecuteForTestAsync(CreateContext(), settings, CancellationToken.None);
 
@@ -171,8 +171,8 @@ public sealed class CleanCommandTests
             .Returns("main");
         _gitService.GetLocalBranchesAsync("/some/repo", "main", Arg.Any<CancellationToken>())
             .Returns(branches);
-        _analyzer.IdentifyStaleBranches(branches, 6).Returns(staleBranches);
-        _analyzer.IdentifyMergedBranches(branches).Returns([]);
+        _analyzer.IdentifyStaleBranches(AnalyzerInput.Matching(branches), 6).Returns(staleBranches);
+        _analyzer.IdentifyMergedBranches(AnalyzerInput.Matching(branches)).Returns([]);
 
         var result = await command.ExecuteForTestAsync(CreateContext(), settings, CancellationToken.None);
 
@@ -217,8 +217,8 @@ public sealed class CleanCommandTests
             .Returns("main");
         _gitService.GetLocalBranchesAsync("/some/repo", "main", Arg.Any<CancellationToken>())
             .Returns(branches);
-        _analyzer.IdentifyStaleBranches(branches, 6).Returns([stale]);
-        _analyzer.IdentifyMergedBranches(branches).Returns([merged]);
+        _analyzer.IdentifyStaleBranches(AnalyzerInput.Matching(branches), 6).Returns([stale]);
+        _analyzer.IdentifyMergedBranches(AnalyzerInput.Matching(branches)).Returns([merged]);
 
         var result = await command.ExecuteForTestAsync(CreateContext(), settings, CancellationToken.None);
 
@@ -243,8 +243,8 @@ public sealed class CleanCommandTests
             .Returns("main");
         _gitService.GetLocalBranchesAsync("/some/repo", "main", Arg.Any<CancellationToken>())
             .Returns(branches);
-        _analyzer.IdentifyStaleBranches(branches, 6).Returns([]);
-        _analyzer.IdentifyMergedBranches(branches).Returns([merged]);
+        _analyzer.IdentifyStaleBranches(AnalyzerInput.Matching(branches), 6).Returns([]);
+        _analyzer.IdentifyMergedBranches(AnalyzerInput.Matching(branches)).Returns([merged]);
 
         var result = await command.ExecuteForTestAsync(CreateContext(), settings, CancellationToken.None);
 

@@ -78,6 +78,30 @@ public sealed class PartialCloneRefusalCliTests : IAsyncLifetime
         Assert.Single(Directory.GetFiles(Path.Combine(work, ".git", "gitsweep", "trash"), "*.json"));
     }
 
+    [Fact]
+    public async Task Trash_save_in_a_partial_clone_fails_closed_and_writes_nothing()
+    {
+        // clean saves a branch to the trash (and creates its keep-ref) before
+        // deleting it. In a partial clone the real save must refuse before any
+        // git command runs: no keep-ref, no new trash record, no uploadpack.
+        var (work, marker) = await BuildHostilePartialCloneWithTrashEntryAsync();
+        var (revParseExit, revParseOutput) = await RunGitWithExitCodeAsync(Path.Combine(_root, "up"), ["rev-parse", "HEAD"]);
+        Assert.Equal(0, revParseExit);
+        var existingSha = revParseOutput.Trim();
+
+        var trash = new TrashService(new GitRepositoryService());
+        var ex = await Assert.ThrowsAsync<PartialCloneNotSupportedException>(
+            () => trash.SaveAsync(work, "main", existingSha, Guid.NewGuid()));
+
+        Assert.Contains("is a partial clone", ex.Message);
+        Assert.False(File.Exists(marker), "the trash save ran the lazy-fetch uploadpack script");
+        // Only the fixture's planted record; nothing was added.
+        Assert.Single(Directory.GetFiles(Path.Combine(work, ".git", "gitsweep", "trash"), "*.json"));
+        var (keepRefsExit, keepRefs) = await RunGitWithExitCodeAsync(work, ["for-each-ref", "--format=%(refname)", "refs/gitsweep/"]);
+        Assert.Equal(0, keepRefsExit);
+        Assert.Equal(string.Empty, keepRefs.Trim());
+    }
+
     private async Task<(string Work, string Marker)> BuildHostilePartialCloneWithTrashEntryAsync()
     {
         var up = Path.Combine(_root, "up");
@@ -110,10 +134,16 @@ public sealed class PartialCloneRefusalCliTests : IAsyncLifetime
         await RunGitAsync(work, ["config", "remote.origin.uploadpack", script.Replace('\\', '/')]);
 
         // Plant the trash entry exactly as GitSweep writes it (TrashService),
-        // pointed at the repository's git dir without running git there.
+        // pointed at the repository's git dir without running git there. It
+        // models what a hostile repository can ship inside its own .git: the
+        // JSON record alone. No keep-ref can exist for it (git refuses to
+        // write a ref to the absent SHA), and restore/undo never need one,
+        // so the substitute reports the keep-ref step as done.
         var locator = Substitute.For<IGitRepositoryService>();
         locator.GetGitCommonDirectoryAsync(work, Arg.Any<CancellationToken>())
             .Returns(Path.GetFullPath(Path.Combine(work, ".git")));
+        locator.CreateTrashKeepRefAsync(work, Arg.Any<string>(), AbsentSha, Arg.Any<CancellationToken>())
+            .Returns((true, string.Empty));
         await new TrashService(locator).SaveAsync(work, RestoredBranch, AbsentSha, Guid.NewGuid());
 
         return (work, marker);

@@ -67,3 +67,82 @@ internal sealed class PromisorRemoteCapabilityFactAttribute : FactAttribute
         }
     }
 }
+
+/// <summary>
+/// Whether this git runs hooks defined in configuration
+/// (<c>hook.&lt;name&gt;.command</c> + <c>hook.&lt;name&gt;.event</c>): by an exact
+/// version check (git &gt;= 2.54.0, where the feature shipped), not a probe.
+/// git 2.43 (the default Linux container) ignores those keys.
+/// </summary>
+internal static class TestConfigHooks
+{
+    // Configuration-defined hooks shipped in git 2.54.0 (release notes:
+    // "Hook commands are now allowed to be defined ... in the configuration
+    // files"). An exact version check (RR-7): a behavioral probe through
+    // `git hook run` misreads a git older than 2.36, which has no `hook`
+    // subcommand, as supporting them.
+    private static readonly Version Required = new(2, 54);
+
+    public static bool IsSupported => TestGitVersion.Current is { } current && current >= Required;
+}
+
+/// <summary>
+/// Whether fetching by URL honors a <c>[remote "&lt;url&gt;"] vcs</c> section,
+/// probed once: git 2.55 runs the named remote helper, git 2.43 stops with
+/// "has no configured URL" before any helper runs.
+/// </summary>
+internal sealed class UrlScopedVcsFactAttribute : FactAttribute
+{
+    private static readonly Lazy<bool> Honored = new(Probe);
+
+    public UrlScopedVcsFactAttribute()
+    {
+        if (!Honored.Value)
+        {
+            Skip = $"git {TestGitVersion.Current?.ToString() ?? "(unknown version)"} does not apply remote.<url>.vcs when fetching by URL, so no helper can run.";
+        }
+    }
+
+    private static bool Probe()
+    {
+        var root = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "GitSweepVcsProbe", Guid.NewGuid().ToString("N"));
+        try
+        {
+            System.IO.Directory.CreateDirectory(root);
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = GitExecutableLocator.GetRequiredPath(),
+                WorkingDirectory = root,
+                RedirectStandardInput = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            foreach (var argument in new[]
+                     {
+                         "-c", "protocol.foo.allow=always", "-c", "alias.remote-foo=!exit 1",
+                         "-c", "remote.https://127.0.0.1:1/probe.git.vcs=foo",
+                         "ls-remote", "https://127.0.0.1:1/probe.git"
+                     })
+            {
+                startInfo.ArgumentList.Add(argument);
+            }
+
+            using var process = Process.Start(startInfo)!;
+            process.StandardInput.Close();
+            process.StandardOutput.ReadToEnd();
+            var stderr = process.StandardError.ReadToEnd();
+            process.WaitForExit();
+            return stderr.Contains("remote helper", StringComparison.Ordinal);
+        }
+        catch (Exception)
+        {
+            return false;
+        }
+        finally
+        {
+            try { System.IO.Directory.Delete(root, recursive: true); } catch (Exception) { }
+        }
+    }
+}

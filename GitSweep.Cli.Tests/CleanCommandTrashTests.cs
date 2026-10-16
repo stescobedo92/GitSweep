@@ -30,8 +30,8 @@ public sealed class CleanCommandTrashTests
         _gitService.IsGitRepositoryAsync("/some/repo", Arg.Any<CancellationToken>()).Returns(true);
         _gitService.GetDefaultBranchNameAsync("/some/repo", Arg.Any<CancellationToken>()).Returns("main");
         _gitService.GetLocalBranchesAsync("/some/repo", "main", Arg.Any<CancellationToken>()).Returns(branches);
-        _analyzer.IdentifyStaleBranches(branches, 6).Returns([]);
-        _analyzer.IdentifyMergedBranches(branches).Returns([merged]);
+        _analyzer.IdentifyStaleBranches(AnalyzerInput.Matching(branches), 6).Returns([]);
+        _analyzer.IdentifyMergedBranches(AnalyzerInput.Matching(branches)).Returns([merged]);
         _gitService.GetBranchTipShaAsync("/some/repo", "feature/merged", Arg.Any<CancellationToken>()).Returns(Sha);
     }
 
@@ -110,6 +110,33 @@ public sealed class CleanCommandTrashTests
 
         Assert.Equal(1, result);
         await _trashService.Received(1).RemoveAsync("/some/repo", entry.Id, Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_removes_trash_entry_when_delete_is_refused_as_unreachable()
+    {
+        // SEC-B04: DeleteBranchAsync refuses a branch whose tip no other ref
+        // contains before `git branch -d` ever runs. The entry saved just
+        // before must be rolled back like any other refusal, and the message
+        // must not be mistaken for git's "not fully merged" (whose tip
+        // suggests force-deleting with -D, bypassing the trash).
+        var console = new TestConsole().Width(400);
+        var command = CreateCommand(console);
+        SetupRepoWithMergedCandidate();
+        var entry = new TrashEntry(Guid.NewGuid().ToString("N"), "feature/merged", Sha, DateTimeOffset.UtcNow, Guid.NewGuid());
+        _trashService.SaveAsync("/some/repo", "feature/merged", Sha, Arg.Any<Guid>(), Arg.Any<CancellationToken>())
+            .Returns(entry);
+        const string refusal =
+            "Branch 'feature/merged' has commits that are not reachable from any other branch, remote-tracking branch or tag; it was not deleted.";
+        _gitService.DeleteBranchAsync("/some/repo", "feature/merged", Arg.Any<CancellationToken>())
+            .Returns((false, refusal));
+
+        var result = await command.ExecuteForTestAsync(CreateContext(), AllYesSettings(), CancellationToken.None);
+
+        Assert.Equal(1, result);
+        await _trashService.Received(1).RemoveAsync("/some/repo", entry.Id, Arg.Any<CancellationToken>());
+        Assert.Contains(refusal, console.Output);
+        Assert.DoesNotContain("git branch -D", console.Output);
     }
 
     [Fact]

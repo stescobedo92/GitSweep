@@ -89,8 +89,9 @@ public class GitRepositoryService : IGitRepositoryService
     // Hooks directory that can never contain an executable hook: the null
     // device on Windows, /dev/null elsewhere. Pointing core.hooksPath at a
     // file (or nonexistent path) makes git look for "<path>/<hook>", which
-    // never exists, so no hook is ever run.
-    private static readonly string NullHooksPath =
+    // never exists, so no hook is ever run. The same device is the (always
+    // empty) graft file, see ApplyHardenedEnvironment.
+    private static readonly string NullDevicePath =
         OperatingSystem.IsWindows() ? "NUL" : "/dev/null";
 
     // Configuration forced on every git invocation. Command-line `-c` values
@@ -140,6 +141,45 @@ public class GitRepositoryService : IGitRepositoryService
     //    repositorio en un clon parcial a mitad de ejecución. "None" (el valor
     //    por defecto de git) no acepta ninguno. Inofensivo en git sin la clave
     //    (verificado con 2.43).
+    //  - hook.<evento>.enabled=false (P1-F1): SOLO defensa en profundidad, no
+    //    la garantía. git >= 2.54 admite hooks definidos en la config
+    //    (`hook.<nombre>.command` + `.event`), que core.hooksPath NO gobierna
+    //    (solo mueve el directorio de hooks). Cada ref que GitSweep actualiza
+    //    (branch -d, branch al restaurar, update-ref de las keep-refs, las
+    //    refs remotas del fetch) dispara reference-transaction, y el
+    //    mantenimiento tras un fetch dispara pre-auto-gc. La clave por evento
+    //    NO basta: en git 2.54.x no existe (solo hay hook.<nombre>.enabled por
+    //    nombre amistoso), y en 2.55 un `hook.reference-transaction.<var>` del
+    //    repositorio hace que git lea esta clave como la de un hook con ese
+    //    nombre amistoso y el hook real sigue corriendo (RG-01/RR-1). La
+    //    garantía real es EnsureNoDangerousConfiguredHooksAsync: rechaza (falla
+    //    cerrado) cualquier repositorio cuya config defina un hook para un
+    //    evento que GitSweep pueda disparar, antes de tocar nada. La guarda ya
+    //    cubre el caso; esta clave se conserva solo como red de seguridad por
+    //    si la config cambiara después de la comprobación (su efecto ya no es
+    //    la garantía).
+    //  - core.alternateRefsCommand= (P1b-03, DOC-V1): con un
+    //    objects/info/alternates en el repositorio, `fetch` ejecuta por el shell
+    //    el valor configurado para listar las refs de cada alternate. Vacío no
+    //    ejecuta nada (git intenta lanzar "" y sigue sin esas refs; verificado
+    //    con 2.55 y 2.43).
+    //  - fetch.bundleURI= (P1b-05): antes del fetch, git descargaría o copiaría
+    //    el bundle que nombra el repositorio y escribiría refs/bundles/* (y
+    //    config) fuera del refspec. Vacío no descarga nada.
+    //  - http.saveCookies=false (P1b-04): con http.cookieFile, curl escribiría
+    //    las cookies del servidor en la ruta que elige el repositorio. Esta
+    //    clave genérica pierde frente a una `http.<url>.saveCookies` del
+    //    repositorio (gana la URL más específica), así que FetchPruneAsync
+    //    además rechaza el fetch si alguna de esas claves vale true.
+    //  - core.useReplaceRefs=false y GIT_GRAFT_FILE (I5): refs/replace/* e
+    //    info/grafts cambian los padres que git ve, así que un repositorio
+    //    hostil podía hacer pasar por mergeada (y por contenida en otra ref)
+    //    una rama con commits únicos: `branch --merged`, `merge-base`,
+    //    `for-each-ref --contains` y el propio `branch -d` lo creían
+    //    (verificado con 2.55 y 2.43). Sin ellos git lee los padres reales.
+    //    advice.graftFileDeprecated=false calla el aviso que git imprime al
+    //    abrir el fichero de grafts (el dispositivo nulo, ver
+    //    ApplyHardenedEnvironment) y que si no ensuciaría cada stderr.
     private static readonly string[] HardenedGitOptions =
     [
         "--no-pager",
@@ -148,7 +188,9 @@ public class GitRepositoryService : IGitRepositoryService
         "-c", "commit.gpgsign=false",
         "-c", "gc.auto=0",
         "-c", "maintenance.auto=false",
-        "-c", $"core.hooksPath={NullHooksPath}",
+        "-c", $"core.hooksPath={NullDevicePath}",
+        "-c", "hook.reference-transaction.enabled=false",
+        "-c", "hook.pre-auto-gc.enabled=false",
         "-c", "protocol.allow=never",
         "-c", "protocol.https.allow=always",
         "-c", "protocol.http.allow=always",
@@ -161,9 +203,18 @@ public class GitRepositoryService : IGitRepositoryService
         "-c", "core.gitProxy=",
         "-c", "core.askPass=",
         "-c", "credential.helper=",
+        "-c", "core.alternateRefsCommand=",
+        "-c", "fetch.bundleURI=",
+        "-c", "http.saveCookies=false",
+        "-c", "core.useReplaceRefs=false",
+        "-c", "advice.graftFileDeprecated=false",
         "-c", "sideband.allowControlCharacters=false",
         "-c", "promisor.acceptFromServer=None"
     ];
+
+    // Lista de transportes permitidos, la misma que fijan las claves
+    // protocol.* de arriba, en el formato de GIT_ALLOW_PROTOCOL.
+    private const string AllowedProtocols = "https:http:ssh:git:file:local";
 
     // Ambient git environment variables removed from every child process so
     // results depend only on the repository path the user selected, never on
@@ -178,8 +229,10 @@ public class GitRepositoryService : IGitRepositoryService
     // removed for the same reason even though no command here performs
     // transport or an external diff: fail closed if one ever does.
     // GIT_EXEC_PATH would make git load its sub-programs (remote helpers,
-    // upload-pack, ...) from an arbitrary directory; GIT_PROXY_COMMAND names
-    // a program git runs for every git:// connection made by `--fetch`.
+    // upload-pack, ...) from an arbitrary directory. GIT_PROXY_COMMAND,
+    // GIT_ALLOW_PROTOCOL and GIT_GRAFT_FILE are not removed but overwritten
+    // in ApplyHardenedEnvironment: their pinned values are what neutralizes
+    // the matching repository config.
     private static readonly string[] RemovedGitEnvironmentVariables =
     [
         "GIT_DIR",
@@ -193,11 +246,9 @@ public class GitRepositoryService : IGitRepositoryService
         "GIT_EXEC_PATH",
         "GIT_SSH",
         "GIT_SSH_COMMAND",
-        "GIT_PROXY_COMMAND",
         "GIT_ASKPASS",
         "SSH_ASKPASS",
         "GIT_EXTERNAL_DIFF",
-        "GIT_ALLOW_PROTOCOL",
         "GIT_PROTOCOL_FROM_USER"
     ];
 
@@ -356,8 +407,38 @@ public class GitRepositoryService : IGitRepositoryService
             return (false, $"Branch '{branchName}' is checked out in a worktree and cannot be deleted.");
         }
 
-        // Safe delete only: never force-delete with -D. A branch git considers
-        // unmerged is refused here and reported to the caller instead.
+        // `git branch -d` no basta para no perder trabajo: acepta una rama
+        // «totalmente mergeada en su upstream», y el upstream sale de la
+        // configuración del repositorio. Un .git/config hostil con
+        // `branch.<rama>.remote = .` y `branch.<rama>.merge = refs/heads/<rama>`
+        // convierte a la rama en su propio upstream, así que `-d` la borra
+        // aunque tenga commits únicos sin subir. Tras el borrado esos commits
+        // solo constan en la entrada JSON de la papelera (el reflog se va con
+        // la rama), el siguiente `git gc` puede podarlos y `undo` ya no puede
+        // restaurarla. Por eso, antes de `-d`, se exige de forma independiente
+        // de la configuración que otra ref (rama local, rama remota de
+        // seguimiento o tag) contenga la punta: si ninguna la contiene, o si
+        // git no da una respuesta válida, la rama no se borra. Después de
+        // `-d` se repite la comprobación sobre el estado real (ver abajo).
+        // Punta resuelta siempre como refs/heads/<rama>^{commit} (nunca un
+        // tag homónimo) y validada como SHA hexadecimal completo; un fallo
+        // por límite lanza dentro de GetBranchTipShaAsync.
+        var tipSha = await GetBranchTipShaAsync(path, branchName, ct);
+        if (tipSha is null)
+        {
+            return (false, ReachabilityUnverifiedMessage(branchName));
+        }
+
+        var refusal = await GetPreDeleteRefusalAsync(path, branchName, tipSha, ct);
+        if (refusal is not null)
+        {
+            return (false, refusal);
+        }
+
+        // Safe delete only: never force-delete with -D. Both checks must
+        // pass: the tip is reachable from another ref (above) and git itself
+        // considers the branch merged; a branch git refuses is reported to
+        // the caller instead.
         var result = await ExecuteGitCommandAsync(path, ["branch", "-d", "--", branchName], ct);
 
         // Un fallo por límite deja el resultado indeterminado, no «no se
@@ -368,7 +449,326 @@ public class GitRepositoryService : IGitRepositoryService
         // de la papelera de una rama que quizá ya no existe; se lanza para
         // que la entrada se conserve.
         ThrowIfLimitFailure(result);
-        return (result.ExitCode == 0, GitOutputRedactor.Redact(string.IsNullOrWhiteSpace(result.Error) ? result.Output : result.Error));
+        var message = GitOutputRedactor.Redact(string.IsNullOrWhiteSpace(result.Error) ? result.Output : result.Error);
+        if (result.ExitCode != 0)
+        {
+            return (false, message);
+        }
+
+        // La comprobación previa no basta por sí sola: un alias del propio
+        // fichero de la ref en el sistema de archivos (un junction o enlace
+        // simbólico a un directorio bajo refs/remotes/ o refs/tags/, o un
+        // enlace a fichero cuyo destino no empieza por "refs/") no es una ref
+        // simbólica para git: for-each-ref lo lista como una ref normal, con
+        // %(symref) vacío, que «contiene» siempre la punta actual de la rama.
+        // Al borrar el fichero de la rama, el alias desaparece con él. Por
+        // eso, ya borrada, se vuelve a preguntar qué refs contienen el SHA
+        // resuelto antes del borrado: el alias ya no existe, así que la
+        // respuesta refleja el estado real sin depender de cómo esté montado
+        // .git/refs. Si ninguna otra ref lo contiene, la rama se vuelve a
+        // crear en esa punta y el borrado se informa como rechazado.
+        return await IsTipStillContainedAfterDeleteAsync(path, branchName, tipSha)
+            ? (true, message)
+            : (false, UnreachableTipMessage(branchName));
+    }
+
+    private static string UnreachableTipMessage(string branchName) =>
+        $"Branch '{branchName}' has commits that are not reachable from any other branch, remote-tracking branch or tag; it was not deleted.";
+
+    private static string ReachabilityUnverifiedMessage(string branchName) =>
+        $"Could not verify that branch '{branchName}' is reachable from another branch, remote-tracking branch or tag; it was not deleted.";
+
+    private static string NotRecreatableMessage(string branchName) =>
+        $"Branch '{branchName}' cannot be recreated by git under this name, so a deletion could not be undone if it left commits unreachable; it was not deleted.";
+
+    private static string RecreationUnverifiedMessage(string branchName) =>
+        $"Could not verify that branch '{branchName}' could be recreated by git if its deletion had to be undone; it was not deleted.";
+
+    private static string CaseVariantMessage(string branchName) =>
+        $"Another branch whose name differs from '{branchName}' only in letter case exists, so git could not reliably recreate '{branchName}' if its deletion had to be undone; it was not deleted.";
+
+    /// <summary>
+    /// Comprobaciones previas al borrado, independientes de la configuración
+    /// del repositorio. Devuelve <c>null</c> si la rama puede pasar a
+    /// <c>git branch -d</c> y, si no, el mensaje (en inglés) con el que
+    /// <see cref="DeleteBranchAsync"/> la rechaza sin ejecutarlo.
+    /// </summary>
+    /// <remarks>
+    /// Exige que git pueda volver a crear la rama con ese nombre (la
+    /// comprobación posterior al borrado la recrea si hace falta) y que otra
+    /// ref real contenga su punta. Un fallo de git o una salida inesperada
+    /// también rechaza el borrado. Un fallo por límite lanza
+    /// <see cref="GitCommandLimitException"/>, igual que los guardas de rama
+    /// actual y worktree que lo preceden: git no respondió y el borrado no
+    /// llega a intentarse, así que clean se detiene sin borrar nada más.
+    /// </remarks>
+    private async Task<string?> GetPreDeleteRefusalAsync(string path, string branchName, string tipSha, CancellationToken ct)
+    {
+        // Si el borrado hubiera que deshacerlo, `git branch -- <rama> <sha>`
+        // debe poder crearla de nuevo. Un repositorio hostil puede traer una
+        // rama que git borra pero ya no deja crear: un nombre reservado
+        // (refs/heads/HEAD, que git rechaza como nombre de rama nueva) o un
+        // conflicto directorio/fichero con otra ref (abajo). Una rama así no
+        // se borra: su borrado no se podría deshacer. Los cerrojos
+        // abandonados (refs/heads/<rama>.lock, packed-refs.lock) no hacen
+        // falta aquí: con ellos ya falla el propio `-d`, y config.lock no
+        // impide recrearla. El nombre ya validado nunca empieza por '-', así
+        // que no puede leerse como opción.
+        // O-3/RR-6: en un FS sensible a mayúsculas donde conviven `Feature` y
+        // `feature`, recrear `feature` tras `-d` lo rechaza CreateBranchAsync
+        // (variante de caja), así que la recreación posterior fallaría y el
+        // borrado acabaría en BranchDeletionVerificationException. Se rechaza
+        // aquí, antes del `-d`, con el mensaje propio de este contexto.
+        switch (await ExistsBranchDifferingOnlyInCaseAsync(path, branchName, ct))
+        {
+            case null:
+                return RecreationUnverifiedMessage(branchName);
+            case true:
+                return CaseVariantMessage(branchName);
+        }
+
+        var nameCheck = await ExecuteGitCommandAsync(path, ["check-ref-format", "--branch", branchName], ct);
+        ThrowIfLimitFailure(nameCheck);
+        if (nameCheck.ExitCode != 0)
+        {
+            return NotRecreatableMessage(branchName);
+        }
+
+        // Conflicto directorio/fichero, en las dos direcciones que comprueba
+        // git al crear una ref:
+        //  1. Cada prefijo propio de refs/heads/<rama>, empezando por "refs" y
+        //     "refs/heads", buscado por su nombre exacto. Un packed-refs hostil
+        //     puede nombrar cualquiera de ellos (git nunca escribe esas refs y
+        //     aun así deja trabajar en las ramas existentes); buscarlos por
+        //     nombre evita recorrer todas las refs en cada borrado.
+        //     `rev-parse --verify --symbolic-full-name` ve también refs cuyo
+        //     objeto no existe. Como aplica las reglas de abreviatura, solo
+        //     cuenta como ausente un 1 (no existe) o un nombre completo
+        //     distinto (resolvió otra ref, p. ej. la rama refs/heads/refs). Si
+        //     imprime el propio prefijo, existe; si sale con 0 sin imprimir
+        //     nada, el nombre es ambiguo (el prefijo exacto más otra ref
+        //     homónima), y eso tampoco es «ausente». Los prefijos empiezan
+        //     por "refs", así que no pueden leerse como opción (sin
+        //     --end-of-options, que rev-parse repetiría en la salida).
+        //  2. Las refs bajo refs/heads/<rama>/, listadas. for-each-ref omite
+        //     (solo avisa en stderr) una ref con nombre inválido, que para git
+        //     sigue ocupando el sitio: un aviso que nombra una ref bajo ese
+        //     prefijo también rechaza el borrado.
+        // Sin distinguir mayúsculas: solo puede añadir rechazos, nunca
+        // quitarlos. El nombre validado no tiene caracteres glob, así que el
+        // patrón del listado es un prefijo literal.
+        var ownRef = $"refs/heads/{branchName}";
+        var components = ownRef.Split('/');
+        for (var length = 1; length < components.Length; length++)
+        {
+            var prefix = string.Join('/', components, 0, length);
+            var lookup = await ExecuteGitCommandAsync(
+                path, ["rev-parse", "--verify", "--quiet", "--symbolic-full-name", prefix], ct);
+            ThrowIfLimitFailure(lookup);
+            var resolved = lookup.Output.Trim();
+            if (lookup.ExitCode == 1 ||
+                (lookup.ExitCode == 0 && resolved.Length > 0 &&
+                 !string.Equals(resolved, prefix, StringComparison.OrdinalIgnoreCase)))
+            {
+                continue;
+            }
+
+            return lookup.ExitCode == 0 && resolved.Length > 0
+                ? NotRecreatableMessage(branchName)
+                : RecreationUnverifiedMessage(branchName);
+        }
+
+        var descendants = await ExecuteGitCommandAsync(
+            path, ["for-each-ref", "--format=%(refname)", ownRef + "/"], ct);
+        ThrowIfLimitFailure(descendants);
+        if (descendants.ExitCode != 0)
+        {
+            return RecreationUnverifiedMessage(branchName);
+        }
+
+        var listedDescendants = descendants.Output.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        if (listedDescendants.Length > 0)
+        {
+            return listedDescendants.All(line => line.TrimEnd('\r').StartsWith(ownRef + "/", StringComparison.OrdinalIgnoreCase))
+                ? NotRecreatableMessage(branchName)
+                : RecreationUnverifiedMessage(branchName);
+        }
+
+        if (descendants.Error.Contains(ownRef + "/", StringComparison.OrdinalIgnoreCase))
+        {
+            return NotRecreatableMessage(branchName);
+        }
+
+        return await IsTipContainedInAnotherRefAsync(path, branchName, tipSha, ct) switch
+        {
+            true => null,
+            false => UnreachableTipMessage(branchName),
+            null => ReachabilityUnverifiedMessage(branchName)
+        };
+    }
+
+    /// <summary>
+    /// Pregunta qué refs reales (ramas locales, ramas remotas de seguimiento,
+    /// tags) contienen <paramref name="tipSha"/>, aparte de
+    /// <c>refs/heads/&lt;rama&gt;</c> y de las keep-refs de GitSweep y sus
+    /// alias. <c>true</c>: al menos una; <c>false</c>: ninguna; <c>null</c>:
+    /// git falló o dio una salida inesperada. Un fallo por límite lanza
+    /// <see cref="GitCommandLimitException"/>.
+    /// </summary>
+    private async Task<bool?> IsTipContainedInAnotherRefAsync(string path, string branchName, string tipSha, CancellationToken ct)
+    {
+        // La keep-ref de la rama ya existe cuando se llega aquí (clean guarda
+        // en la papelera antes de borrar) y contiene la punta por construcción.
+        // CreateTrashKeepRefAsync impide que sea un alias de una rama remota o
+        // un tag, pero si un fallo futuro lo dejara pasar, contarla haría pasar
+        // toda rama (T4R3-01). Por eso nunca cuenta una ref bajo refs/gitsweep/
+        // ni una cuyo último componente sea el id de una keep-ref existente o
+        // creada en esta ejecución. Un id es un GUID aleatorio, así que esto
+        // nunca excluye una ref real del usuario; si no se puede listar, la
+        // respuesta es «no verificado».
+        var keepRefIds = await GetTrashKeepRefIdsAsync(path, ct);
+        if (keepRefIds is null)
+        {
+            return null;
+        }
+
+        // Ningún argumento puede leerse como opción: el SHA validado empieza
+        // por un dígito hexadecimal y los patrones son constantes. Campos
+        // separados por TAB, que ningún nombre de ref puede contener.
+        // %(symref) identifica las refs simbólicas: no guardan commits
+        // propios, y un repositorio hostil puede plantar una (por ejemplo
+        // refs/remotes/origin/HEAD) que apunte a la propia rama; al borrarla
+        // quedaría colgando, así que nunca cuentan como «otra ref».
+        string[] refPrefixes = ["refs/heads/", "refs/remotes/", "refs/tags/"];
+        var result = await ExecuteGitCommandAsync(
+            path, ["for-each-ref", "--contains", tipSha, "--format=%(refname)%09%(symref)", .. refPrefixes], ct);
+        ThrowIfLimitFailure(result);
+        if (result.ExitCode != 0)
+        {
+            return null;
+        }
+
+        // La propia rama se compara sin distinguir mayúsculas, como el resto
+        // del servicio: en un sistema de archivos que no las distingue, una
+        // variante de mayúsculas puede ser la misma ref que borra `-d`.
+        // Ignorarla solo puede rechazar un borrado, nunca permitirlo.
+        var ownRef = $"refs/heads/{branchName}";
+        var containedElsewhere = false;
+        foreach (var rawLine in result.Output.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var fields = rawLine.TrimEnd('\r').Split('\t');
+            if (fields.Length != 2 ||
+                !refPrefixes.Any(prefix => fields[0].StartsWith(prefix, StringComparison.Ordinal)))
+            {
+                return null;
+            }
+
+            if (fields[1].Length == 0 &&
+                !string.Equals(fields[0], ownRef, StringComparison.OrdinalIgnoreCase) &&
+                !IsKeepRefOrAlias(fields[0], keepRefIds))
+            {
+                containedElsewhere = true;
+            }
+        }
+
+        return containedElsewhere;
+    }
+
+    /// <summary>
+    /// Comprobación posterior a un <c>git branch -d</c> que tuvo éxito.
+    /// Devuelve <c>true</c> si otra ref real sigue conteniendo
+    /// <paramref name="tipSha"/>. Si ninguna lo contiene, vuelve a crear la
+    /// rama en esa punta (nunca con <c>-f</c>) y devuelve <c>false</c>, para
+    /// que el borrado se informe como rechazado y clean revierta la entrada
+    /// de la papelera de una rama que vuelve a existir.
+    /// </summary>
+    /// <remarks>
+    /// Nunca devuelve <c>false</c> con la rama sin recrear: clean revertiría
+    /// entonces la entrada de la papelera, quizá el único registro del SHA.
+    /// <list type="bullet">
+    /// <item>Si la recreación falla, lanza
+    /// <see cref="BranchDeletionVerificationException"/> con el nombre y el
+    /// SHA: la entrada se conserva y clean se detiene.</item>
+    /// <item>Si la comprobación misma falla, la rama se recrea igualmente
+    /// (lo seguro ante la duda) y después se lanza: la
+    /// <see cref="GitCommandLimitException"/> original si fue un límite, y
+    /// <see cref="BranchDeletionVerificationException"/> en otro caso.</item>
+    /// </list>
+    /// Ninguna de las dos la traga un <c>catch</c> filtrado de la CLI. Usa
+    /// <see cref="CancellationToken.None"/>: con la rama ya borrada, la
+    /// comprobación y la recreación deben terminar (cada comando sigue
+    /// acotado por su plazo); <c>gc.auto=0</c> forzado impide que se poden
+    /// objetos entretanto.
+    /// </remarks>
+    private async Task<bool> IsTipStillContainedAfterDeleteAsync(string path, string branchName, string tipSha)
+    {
+        var ct = CancellationToken.None;
+        bool? containedElsewhere;
+        GitCommandLimitException? limitFailure = null;
+        try
+        {
+            containedElsewhere = await IsTipContainedInAnotherRefAsync(path, branchName, tipSha, ct);
+        }
+        catch (GitCommandLimitException ex)
+        {
+            containedElsewhere = null;
+            limitFailure = ex;
+        }
+
+        if (containedElsewhere == true)
+        {
+            return true;
+        }
+
+        string? recreationFailure = null;
+        var (created, createError) = await CreateBranchAsync(path, branchName, tipSha, ct);
+        if (!created)
+        {
+            recreationFailure = string.IsNullOrWhiteSpace(createError) ? "git branch failed." : createError.Trim();
+        }
+        else
+        {
+            try
+            {
+                var recreatedTip = await GetBranchTipShaAsync(path, branchName, ct);
+                if (!string.Equals(recreatedTip, tipSha, StringComparison.OrdinalIgnoreCase))
+                {
+                    recreationFailure = "the recreated branch does not point at its original tip.";
+                }
+            }
+            catch (GitCommandLimitException ex)
+            {
+                recreationFailure = ex.Message;
+            }
+        }
+
+        if (recreationFailure is not null)
+        {
+            var reachability = containedElsewhere is null
+                ? "GitSweep could not verify that another branch, remote-tracking branch or tag still contains its tip"
+                : "no other branch, remote-tracking branch or tag contains its tip";
+            var failureMessage =
+                $"Branch '{branchName}' was deleted, but {reachability} {tipSha}, and recreating the branch failed: {recreationFailure.TrimEnd('.')}. " +
+                $"Its commit is safe: the GitSweep trash and a keep-ref under refs/gitsweep/trash/ hold {tipSha}, so 'git gc' will not discard it.";
+            throw limitFailure is null
+                ? new BranchDeletionVerificationException(failureMessage)
+                : new BranchDeletionVerificationException(failureMessage, limitFailure);
+        }
+
+        if (limitFailure is not null)
+        {
+            // La rama ya está recreada en su punta, pero un límite nunca es
+            // una respuesta de git: se relanza la excepción original.
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw(limitFailure);
+        }
+
+        if (containedElsewhere is null)
+        {
+            throw new BranchDeletionVerificationException(
+                $"Could not verify that the commits of branch '{branchName}' are still reachable after deleting it; the branch was recreated at its tip {tipSha}.");
+        }
+
+        return false;
     }
 
     public async Task<(bool Success, string ErrorMessage)> FetchPruneAsync(string path, CancellationToken ct = default)
@@ -427,6 +827,12 @@ public class GitRepositoryService : IGitRepositoryService
             return (false, "Remote 'origin' is not configured; cannot fetch and prune.");
         }
 
+        var cookieRefusal = await GetSaveCookiesRefusalAsync(path, ct);
+        if (cookieRefusal is not null)
+        {
+            return (false, cookieRefusal);
+        }
+
         // El fetch es la única operación de red y lleva su propio plazo,
         // más largo que el de la plomería local. Un origin hostil que acepta
         // la conexión y nunca responde (o que inunda stderr con texto
@@ -436,9 +842,14 @@ public class GitRepositoryService : IGitRepositoryService
         (int ExitCode, string Output, string Error) result;
         try
         {
+            // --no-prune-tags (P1b-06): un fetch.pruneTags/remote.<url>.pruneTags
+            // del repositorio añadiría refs/tags/*:refs/tags/* y podaría tags
+            // LOCALES. Hoy git ya no lo aplica cuando hay un refspec en la línea
+            // de comandos, pero esa regla no está documentada: se fija también
+            // aquí.
             result = await RunRepositoryGitCommandAsync(
                 path,
-                ["fetch", "--prune", "--no-tags", "--recurse-submodules=no", "--upload-pack=git-upload-pack", "--refmap=", remoteUrl, "+refs/heads/*:refs/remotes/origin/*"],
+                ["fetch", "--prune", "--no-prune-tags", "--no-tags", "--recurse-submodules=no", "--upload-pack=git-upload-pack", "--refmap=", remoteUrl, "+refs/heads/*:refs/remotes/origin/*"],
                 _limits.FetchTimeout,
                 ct,
                 null);
@@ -451,12 +862,78 @@ public class GitRepositoryService : IGitRepositoryService
             // promisor.acceptFromServer + promisor.storeFields), así que tras cada
             // intento (éxito, fallo, límite o cancelación) se olvida el «no es
             // un clon parcial» memorizado y el siguiente comando vuelve a
-            // comprobarlo.
+            // comprobarlo. Igual con la verificación de hooks configurados: el
+            // fetch es el único comando que podría dejar config nueva.
             _verifiedNotPartialClone.TryRemove(PartialCloneMemoKey(path), out _);
+            _verifiedNoDangerousConfiguredHooks.TryRemove(PartialCloneMemoKey(path), out _);
         }
 
         var message = string.IsNullOrWhiteSpace(result.Error) ? result.Output.Trim() : result.Error.Trim();
         return (result.ExitCode == 0, GitOutputRedactor.Redact(message));
+    }
+
+    // Claves http.<url>.saveCookies, en la forma normalizada de
+    // `git config --get-regexp` (sección y variable en minúsculas). La genérica
+    // http.saveCookies no encaja (exige una subsección): la neutraliza el -c.
+    private const string UrlScopedSaveCookiesRegex = @"^http\..+\.savecookies$";
+
+    /// <summary>
+    /// P1b-04: <c>null</c> si ninguna clave <c>http.&lt;url&gt;.saveCookies</c>
+    /// vale true; si no, el mensaje (en inglés) con el que se rechaza el fetch.
+    /// </summary>
+    /// <remarks>
+    /// Con <c>http.cookieFile</c> y <c>http.saveCookies</c>, curl escribe al
+    /// terminar las cookies que mandó el servidor, como un fichero de cookies
+    /// de Netscape, en la ruta que eligió el repositorio: un fichero fuera del
+    /// repositorio (p. ej. ~/.bashrc) sobrescrito con líneas que controla el
+    /// servidor. La clave genérica la neutraliza el -c http.saveCookies=false,
+    /// pero la de una URL gana a la genérica (la coincidencia más específica
+    /// gana, esté en el fichero que esté) y no se puede fijar sin conocer la
+    /// URL efectiva, que el propio repositorio puede redirigir
+    /// (<c>[remote "&lt;url&gt;"] url</c>, insteadOf). Por eso se rechaza el
+    /// fetch si alguna clave con URL vale true. <c>--type=bool</c> normaliza
+    /// el valor; uno que no es booleano hace fallar a git, y cualquier
+    /// respuesta que no sea «ninguna» o una lista legible también rechaza el
+    /// fetch. El patrón es una constante: no puede leerse como opción.
+    /// </remarks>
+    private async Task<string?> GetSaveCookiesRefusalAsync(string path, CancellationToken ct)
+    {
+        const string unverified =
+            "Could not check the repository's http.<url>.saveCookies settings; refusing to fetch.";
+
+        var result = await ExecuteGitCommandAsync(
+            path, ["config", "-z", "--type=bool", "--get-regexp", UrlScopedSaveCookiesRegex], ct);
+        if (result.ExitCode == 1 && result.Output.Length == 0)
+        {
+            return null;
+        }
+
+        if (result.ExitCode != 0)
+        {
+            return unverified;
+        }
+
+        var records = result.Output.Split('\0', StringSplitOptions.RemoveEmptyEntries);
+        if (records.Length == 0)
+        {
+            return unverified;
+        }
+
+        foreach (var record in records)
+        {
+            var newline = record.IndexOf('\n');
+            var value = newline < 0 ? string.Empty : record[(newline + 1)..].Trim();
+            if (value == "false")
+            {
+                continue;
+            }
+
+            return value == "true"
+                ? "The repository configuration sets http.<url>.saveCookies, which would let the remote write a cookie file at a path chosen by the repository; refusing to fetch. Remove that setting, or run clean without --fetch."
+                : unverified;
+        }
+
+        return null;
     }
 
     public async Task<bool> IsSquashOrRebaseMergedAsync(string path, string targetBranch, string branchName, CancellationToken ct = default)
@@ -776,15 +1253,442 @@ public class GitRepositoryService : IGitRepositoryService
             return (false, "Invalid commit SHA.");
         }
 
-        // Never overwrite: plain `git branch <name> <sha>` fails when the
-        // branch already exists (no -f, no -D anywhere in GitSweep). The SHA
-        // operand starts with a hex digit so it can never parse as an option;
-        // `--` keeps the branch name from parsing as one either.
+        // P3-T1 (O8): en un sistema de archivos que no distingue mayúsculas
+        // (Windows, macOS), crear refs/heads/feature con un `Feature`
+        // empaquetado deja un fichero suelto que git lee también como
+        // refs/heads/Feature: la rama existente pasaría a apuntar al commit
+        // restaurado. Se rechaza si ya hay una rama cuyo nombre solo difiere
+        // en mayúsculas, en todos los sistemas (solo añade rechazos).
+        // N-1: un fallo por límite en este listado se informa como fallo (no
+        // se relanza), para cumplir el contrato de CreateBranchAsync («nunca
+        // lanza»): así restore conserva la entrada y su keep-ref y sigue el
+        // lote, y la recreación posterior al borrado acaba en
+        // BranchDeletionVerificationException como siempre. El guardado del
+        // propio GetPreDeleteRefusalAsync sí relanza (coherente con sus pares).
+        bool? caseVariant;
+        try
+        {
+            caseVariant = await ExistsBranchDifferingOnlyInCaseAsync(path, branchName, ct);
+        }
+        catch (GitCommandLimitException ex)
+        {
+            return (false, ex.Message);
+        }
+
+        switch (caseVariant)
+        {
+            case null:
+                return (false, "Could not list the existing branches.");
+            case true:
+                return (false, $"A branch whose name differs from '{branchName}' only in letter case already exists; git could not keep both apart on a case-insensitive file system, so '{branchName}' was not created.");
+        }
+
+        // Never overwrite: plain `git branch <name> <start>` fails when the
+        // branch already exists (no -f, no -D anywhere in GitSweep). `--`
+        // keeps the branch name from parsing as an option, and the start
+        // point starts with a hex digit, so it cannot parse as one either.
+        // V-01 / O-F1: el punto de partida va como `<sha>^{commit}`, nunca como
+        // el SHA desnudo. `git branch` pasa el punto de partida por dwim_ref,
+        // que sustituye un SHA de 40/64 hex por el valor de una ref con ese
+        // mismo nombre (p. ej. un tag `<sha>` que llegó con un fetch): la rama
+        // se creaba en otro commit y restore/undo borraban después la entrada
+        // y la keep-ref del commit que nunca se restauró. Ninguna ref puede
+        // llamarse `<sha>^{commit}`, así que git usa el objeto y lo pela a
+        // commit (verificado con 2.55).
         // Un fallo por límite se informa como fallo: restore conserva la
         // entrada de la papelera, y si git llegó a crear la rama, el
-        // siguiente restore informa AlreadyExists sin tocar nada.
-        var result = await ExecuteGitCommandAsync(path, ["branch", "--", branchName, commitSha], ct);
-        return (result.ExitCode == 0, GitOutputRedactor.Redact(string.IsNullOrWhiteSpace(result.Error) ? result.Output.Trim() : result.Error.Trim()));
+        // siguiente restore la encuentra y decide sin crear nada.
+        var result = await ExecuteGitCommandAsync(path, ["branch", "--", branchName, $"{commitSha}^{{commit}}"], ct);
+        var message = GitOutputRedactor.Redact(string.IsNullOrWhiteSpace(result.Error) ? result.Output.Trim() : result.Error.Trim());
+        if (result.ExitCode != 0)
+        {
+            return (false, message);
+        }
+
+        // Nunca fiarse solo de que git terminó con 0: la rama debe apuntar al
+        // commit pedido. Si no (o si no se puede comprobar), se informa como
+        // fallo, así que restore conserva la entrada y su keep-ref.
+        string? createdTip;
+        try
+        {
+            createdTip = await GetBranchTipShaAsync(path, branchName, ct);
+        }
+        catch (GitCommandLimitException ex)
+        {
+            return (false, ex.Message);
+        }
+
+        return string.Equals(createdTip, commitSha, StringComparison.OrdinalIgnoreCase)
+            ? (true, message)
+            : (false, $"git created branch '{branchName}', but it does not point at commit {commitSha.ToLowerInvariant()}.");
+    }
+
+    /// <summary>
+    /// <c>true</c> si ya existe una rama cuyo nombre coincide con
+    /// <paramref name="branchName"/> salvo en mayúsculas (otra ref distinta,
+    /// misma caja ignorada); <c>false</c> si no; <c>null</c> si no se puede
+    /// listar. El patrón del listado es una constante. Un fallo por límite
+    /// lanza.
+    /// </summary>
+    private async Task<bool?> ExistsBranchDifferingOnlyInCaseAsync(string path, string branchName, CancellationToken ct)
+    {
+        var listing = await ExecuteGitCommandAsync(path, ["for-each-ref", "--format=%(refname)", "refs/heads/"], ct);
+        ThrowIfLimitFailure(listing);
+        if (listing.ExitCode != 0)
+        {
+            return null;
+        }
+
+        var ownRef = $"refs/heads/{branchName}";
+        return listing.Output.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .Select(line => line.TrimEnd('\r'))
+            .Any(refName => string.Equals(refName, ownRef, StringComparison.OrdinalIgnoreCase) &&
+                            !string.Equals(refName, ownRef, StringComparison.Ordinal));
+    }
+
+    // Espacio de nombres propio de GitSweep, fuera de refs/heads, refs/remotes
+    // y refs/tags: las comprobaciones de alcanzabilidad nunca cuentan una
+    // keep-ref (ni un alias suyo, ver IsKeepRefOrAlias) como «otra rama», así
+    // que su presencia no altera la decisión de borrado; solo mantiene vivo el
+    // commit frente a `git gc`.
+    private const string TrashKeepRefNamespace = "refs/gitsweep/";
+    private const string TrashKeepRefPrefix = "refs/gitsweep/trash/";
+
+    // Directorios, relativos al directorio git común, por los que git escribe
+    // el fichero suelto de una keep-ref: refs/gitsweep/trash/<id>.
+    private static readonly string[] TrashKeepRefDirectories = ["refs", "gitsweep", "trash"];
+
+    // Ids de todas las keep-refs que este servicio ha intentado crear en esta
+    // ejecución (se anotan antes de crearlas). Las comprobaciones de
+    // alcanzabilidad nunca cuentan una ref cuyo último componente sea uno de
+    // estos ids, aunque git no liste la keep-ref bajo refs/gitsweep/ (un
+    // junction en refs/gitsweep/trash hace que git for Windows escriba el
+    // fichero en el destino y deje de verlo con su propio nombre).
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _trashKeepRefIdsThisRun =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    private static string KeepRefPathUnsafeMessage(string directory) =>
+        $"'{directory}' in the repository's git directory is a symbolic link, a junction or another reparse point, or is not a plain directory, so the keep-ref could be redirected into another ref namespace";
+
+    private const string KeepRefAliasMessage =
+        "the keep-ref is also visible under another ref name (a linked directory in the repository's ref store), where a fetch or prune could delete it";
+
+    private const string KeepRefUnverifiedMessage =
+        "GitSweep could not verify that git sees the keep-ref only under its own name";
+
+    public async Task<(bool Success, string ErrorMessage)> CreateTrashKeepRefAsync(
+        string path, string trashId, string commitSha, CancellationToken ct = default)
+    {
+        if (!TrashService.IsValidTrashId(trashId) || !IsHexSha(commitSha))
+        {
+            return (false, "the trash id or the commit SHA is invalid");
+        }
+
+        var keepRef = TrashKeepRefPrefix + trashId;
+        var sha = commitSha.ToLowerInvariant();
+
+        // Se anota antes de tocar nada, para que ninguna ref con este id cuente
+        // jamás como «otra ref» en esta ejecución, se cree o no la keep-ref.
+        _trashKeepRefIdsThisRun.TryAdd(trashId, 0);
+
+        // 1. Sistema de archivos, antes de crear nada. Un enlace en
+        // refs/gitsweep o refs/gitsweep/trash (un junction, que no requiere
+        // privilegios, o un enlace simbólico relativo que viaja en un tarball)
+        // hace que git escriba la keep-ref físicamente en su destino: bajo
+        // refs/remotes/<remoto> pasa a ser una rama remota de seguimiento que
+        // el siguiente `fetch --prune` (incluido el de `clean --fetch`) borra,
+        // bajo refs/tags un tag que `--prune-tags` borra, y en ambos casos la
+        // comprobación previa al borrado la contaría como «otra ref». Por eso
+        // cada componente existente debe ser un directorio real; los ausentes
+        // los crea git como directorios reales.
+        var commonDirectory = await GetGitCommonDirectoryAsync(path, ct);
+        if (commonDirectory is null)
+        {
+            return (false, "the repository's git directory could not be resolved");
+        }
+
+        var unsafeDirectory = FindUnsafeKeepRefDirectory(commonDirectory);
+        if (unsafeDirectory is not null)
+        {
+            return (false, KeepRefPathUnsafeMessage(unsafeDirectory));
+        }
+
+        // 2. Solo-creación: el valor antiguo todo-ceros (de la longitud del
+        // SHA, 40 o 64 según el formato de objeto del repo) exige que la ref no
+        // exista. Así, un refs/gitsweep o refs/gitsweep/trash plantado
+        // (empaquetado o como fichero) hace fallar la creación y el guardado
+        // falla cerrado. --no-deref escribe la propia ref, nunca el destino de
+        // un symref. core.logAllRefUpdates=false: ningún reflog que un enlace
+        // en logs/ pudiera desviar fuera de .git. El nombre empieza por
+        // "refs/" y los SHA por un dígito hexadecimal, así que ningún operando
+        // puede leerse como opción.
+        var zeroOid = new string('0', sha.Length);
+        try
+        {
+            var create = await ExecuteGitCommandAsync(
+                path, ["-c", "core.logAllRefUpdates=false", "update-ref", "--no-deref", keepRef, sha, zeroOid], ct);
+            ThrowIfLimitFailure(create);
+            if (create.ExitCode != 0)
+            {
+                return (false, "git could not create it");
+            }
+
+            var refusal = await GetCreatedKeepRefRefusalAsync(path, keepRef, trashId, sha, ct);
+            if (refusal is null)
+            {
+                return (true, string.Empty);
+            }
+
+            await DeleteTrashKeepRefAsync(path, trashId, sha, CancellationToken.None);
+            return (false, refusal);
+        }
+        catch (Exception)
+        {
+            // Límite o cancelación con la keep-ref quizá creada: se quita (si
+            // existe con este valor) y se relanza; el guardado falla cerrado.
+            await DeleteTrashKeepRefAsync(path, trashId, sha, CancellationToken.None);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Comprobaciones de una keep-ref recién creada: <c>null</c> si resuelve a
+    /// <paramref name="sha"/> y git la ve solo con su propio nombre; si no, el
+    /// motivo (en inglés) del rechazo. Un fallo por límite lanza
+    /// <see cref="GitCommandLimitException"/>.
+    /// </summary>
+    /// <remarks>
+    /// Defensa en profundidad, independiente del sistema de archivos (cubre
+    /// también un enlace en otro sitio que apunte a refs/gitsweep/trash, un
+    /// montaje...): todo alias de la keep-ref es el mismo fichero visto a
+    /// través de un directorio enlazado, así que su nombre termina en
+    /// <c>/&lt;id&gt;</c>, y el id es un GUID aleatorio que ninguna otra ref
+    /// puede llevar por azar. Se rechaza:
+    /// <list type="bullet">
+    /// <item>cualquier otro nombre listado cuyo último componente sea el id;</item>
+    /// <item>un aviso de stderr que nombre el id: for-each-ref solo avisa de
+    /// una ref con nombre inválido (p. ej. bajo refs/remotes/origin/a..b),
+    /// pero `fetch --prune` sí la borra, y el fichero de la keep-ref con ella;</item>
+    /// <item>que la propia keep-ref no aparezca en el listado: es el mismo
+    /// recorrido de refs que usa `git gc` para decidir qué conservar, así que
+    /// una keep-ref invisible para él no protegería nada.</item>
+    /// </list>
+    /// Quitarla después con comparar-y-borrar nunca borra una ref del usuario:
+    /// la creación solo-creación tuvo éxito, así que ningún fichero existía en
+    /// esa ruta y el borrado por nombre solo quita el que git acaba de crear
+    /// (cualquier alias es ese mismo fichero; una ref distinta con el mismo id
+    /// no se toca).
+    /// </remarks>
+    private async Task<string?> GetCreatedKeepRefRefusalAsync(
+        string path, string keepRef, string trashId, string sha, CancellationToken ct)
+    {
+        // Nunca fiarse solo de la creación: verificar que resuelve al SHA.
+        var verify = await ExecuteGitCommandAsync(
+            path, ["rev-parse", "--verify", "--quiet", keepRef], ct);
+        ThrowIfLimitFailure(verify);
+        if (verify.ExitCode != 0 ||
+            !string.Equals(verify.Output.Trim(), sha, StringComparison.OrdinalIgnoreCase))
+        {
+            return "it does not resolve to the saved commit";
+        }
+
+        // Todas las refs (sin patrón: un alias puede estar en cualquier
+        // espacio de nombres) que apuntan exactamente al SHA, acotado por las
+        // refs en ese commit. El SHA validado empieza por un dígito
+        // hexadecimal, así que no puede leerse como opción.
+        var listing = await ExecuteGitCommandAsync(
+            path, ["for-each-ref", "--points-at", sha, "--format=%(refname)"], ct);
+        ThrowIfLimitFailure(listing);
+        if (listing.ExitCode != 0)
+        {
+            return KeepRefUnverifiedMessage;
+        }
+
+        var keepRefListed = false;
+        foreach (var rawLine in listing.Output.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var refName = rawLine.TrimEnd('\r');
+            if (!refName.StartsWith("refs/", StringComparison.Ordinal))
+            {
+                return KeepRefUnverifiedMessage;
+            }
+
+            if (string.Equals(refName, keepRef, StringComparison.Ordinal))
+            {
+                keepRefListed = true;
+            }
+            else if (string.Equals(LastRefComponent(refName), trashId, StringComparison.OrdinalIgnoreCase))
+            {
+                return KeepRefAliasMessage;
+            }
+        }
+
+        if (listing.Error.Contains(trashId, StringComparison.OrdinalIgnoreCase))
+        {
+            return KeepRefAliasMessage;
+        }
+
+        return keepRefListed ? null : KeepRefUnverifiedMessage;
+    }
+
+    /// <summary>
+    /// Inspecciona, sin seguir enlaces, los directorios por los que git
+    /// escribirá la keep-ref bajo <paramref name="commonDirectory"/>.
+    /// Devuelve <c>null</c> si <c>refs</c> es un directorio real y
+    /// <c>refs/gitsweep</c> y <c>refs/gitsweep/trash</c> son directorios reales
+    /// o no existen; si no, el nombre relativo (<c>refs</c>,
+    /// <c>refs/gitsweep</c> o <c>refs/gitsweep/trash</c>) del primero que no
+    /// lo es.
+    /// </summary>
+    /// <remarks>
+    /// También <c>refs</c>: un enlace ahí traslada todo el almacén de refs a
+    /// otro directorio, y lo que ese directorio sea para otro repositorio (por
+    /// ejemplo sus refs/remotes) queda fuera de lo que git puede comprobar
+    /// aquí. Los componentes se comprueban en orden, así que la ruta de cada
+    /// uno solo atraviesa directorios ya verificados como reales. Cualquier
+    /// error al inspeccionar cuenta como inseguro.
+    /// </remarks>
+    private static string? FindUnsafeKeepRefDirectory(string commonDirectory)
+    {
+        var current = commonDirectory;
+        var relative = string.Empty;
+        foreach (var component in TrashKeepRefDirectories)
+        {
+            current = Path.Combine(current, component);
+            relative = relative.Length == 0 ? component : relative + "/" + component;
+            switch (InspectKeepRefDirectory(current))
+            {
+                case KeepRefDirectoryState.RealDirectory:
+                    continue;
+                case KeepRefDirectoryState.Absent when relative != "refs":
+                    // git crea como directorios reales este y los siguientes.
+                    return null;
+                default:
+                    return relative;
+            }
+        }
+
+        return null;
+    }
+
+    private enum KeepRefDirectoryState
+    {
+        Absent,
+        RealDirectory,
+        Unsafe
+    }
+
+    private static KeepRefDirectoryState InspectKeepRefDirectory(string path)
+    {
+        try
+        {
+            var info = new DirectoryInfo(path);
+
+            // LinkTarget lee el propio enlace sin seguirlo: no es null para un
+            // enlace simbólico ni para un junction, aunque su destino no
+            // exista (Exists, en cambio, sigue el enlace y diría «ausente»).
+            if (info.LinkTarget is not null)
+            {
+                return KeepRefDirectoryState.Unsafe;
+            }
+
+            if (!info.Exists)
+            {
+                // Un fichero (u otro objeto que no es un directorio) en medio
+                // no es «ausente».
+                return File.Exists(path) ? KeepRefDirectoryState.Unsafe : KeepRefDirectoryState.Absent;
+            }
+
+            // Cualquier otro punto de reanálisis (no solo enlaces y junctions)
+            // también se rechaza.
+            var attributes = info.Attributes;
+            return (attributes & FileAttributes.ReparsePoint) == 0 && (attributes & FileAttributes.Directory) != 0
+                ? KeepRefDirectoryState.RealDirectory
+                : KeepRefDirectoryState.Unsafe;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException
+                                       or NotSupportedException or System.Security.SecurityException)
+        {
+            return KeepRefDirectoryState.Unsafe;
+        }
+    }
+
+    private static string LastRefComponent(string refName) =>
+        refName[(refName.LastIndexOf('/') + 1)..];
+
+    /// <summary>
+    /// Ids de keep-ref que las comprobaciones de alcanzabilidad excluyen: los
+    /// que este servicio intentó crear en esta ejecución más los de las
+    /// keep-refs que git lista bajo <c>refs/gitsweep/</c>. <c>null</c> si el
+    /// listado falla o da una salida inesperada; un fallo por límite lanza
+    /// <see cref="GitCommandLimitException"/>.
+    /// </summary>
+    private async Task<HashSet<string>?> GetTrashKeepRefIdsAsync(string path, CancellationToken ct)
+    {
+        var ids = new HashSet<string>(_trashKeepRefIdsThisRun.Keys, StringComparer.OrdinalIgnoreCase);
+
+        // El patrón es una constante: no puede leerse como opción. Solo
+        // cuentan los últimos componentes con forma de id (32 hex): un enlace
+        // en refs/gitsweep hacia otro espacio de nombres listaría aquí también
+        // nombres como "main", que nunca deben excluirse.
+        var listing = await ExecuteGitCommandAsync(
+            path, ["for-each-ref", "--format=%(refname)", TrashKeepRefNamespace], ct);
+        ThrowIfLimitFailure(listing);
+        if (listing.ExitCode != 0)
+        {
+            return null;
+        }
+
+        foreach (var rawLine in listing.Output.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var refName = rawLine.TrimEnd('\r');
+            if (!refName.StartsWith(TrashKeepRefNamespace, StringComparison.Ordinal))
+            {
+                return null;
+            }
+
+            var lastComponent = LastRefComponent(refName);
+            if (TrashService.IsValidTrashId(lastComponent))
+            {
+                ids.Add(lastComponent);
+            }
+        }
+
+        return ids;
+    }
+
+    // Una keep-ref o un alias suyo nunca cuenta como «otra ref» que contenga
+    // la punta: no es una rama, rama remota ni tag del usuario, y un alias bajo
+    // refs/remotes o refs/tags desaparece con el siguiente prune.
+    private static bool IsKeepRefOrAlias(string refName, HashSet<string> keepRefIds) =>
+        refName.StartsWith(TrashKeepRefNamespace, StringComparison.OrdinalIgnoreCase) ||
+        keepRefIds.Contains(LastRefComponent(refName));
+
+    public async Task<bool> DeleteTrashKeepRefAsync(
+        string path, string trashId, string commitSha, CancellationToken ct = default)
+    {
+        if (!TrashService.IsValidTrashId(trashId) || !IsHexSha(commitSha))
+        {
+            return false;
+        }
+
+        var keepRef = TrashKeepRefPrefix + trashId;
+
+        // Comparar-y-borrar: git solo quita la ref si aún apunta a <commitSha>,
+        // así que una ref con otro valor jamás se borra y una ausente falla sin
+        // efecto. Best-effort: cualquier fallo (incluido un límite) deja la
+        // keep-ref, lo cual es seguro (solo fija el commit) y nunca bloquea una
+        // restauración.
+        try
+        {
+            var result = await ExecuteGitCommandAsync(
+                path, ["update-ref", "-d", "--no-deref", keepRef, commitSha.ToLowerInvariant()], ct);
+            return result.ExitCode == 0;
+        }
+        catch (GitCommandLimitException)
+        {
+            return false;
+        }
     }
 
     public async Task<string?> GetCurrentBranchAsync(string path, CancellationToken ct = default)
@@ -938,15 +1842,21 @@ public class GitRepositoryService : IGitRepositoryService
 
     /// <summary>
     /// Punto único por el que pasa todo comando git contra un repositorio
-    /// (plomería local y <c>fetch</c>): antes de lanzarlo comprueba que el
-    /// repositorio no es un clon parcial (<see cref="EnsureNotPartialCloneAsync"/>).
-    /// En un clon parcial cualquier comando que lea un objeto ausente
-    /// (<c>cherry</c>, <c>branch &lt;rama&gt; &lt;sha&gt;</c>, <c>rev-parse
-    /// &lt;sha&gt;^{commit}</c>, <c>log</c>...) dispara un lazy fetch que
-    /// ejecuta el <c>remote.&lt;promisor&gt;.uploadpack</c> del repositorio, así
-    /// que la guarda vive aquí y no en cada método: un método nuevo queda
-    /// cubierto sin acordarse de ella. Solo
-    /// <see cref="ExecuteObjectFreeGitCommandAsync"/> la omite.
+    /// (plomería local y <c>fetch</c>): antes de lanzarlo aplica dos guardas,
+    /// que viven aquí y no en cada método para que un método nuevo quede
+    /// cubierto sin acordarse de ellas:
+    /// <list type="number">
+    /// <item><see cref="EnsureNotPartialCloneAsync"/>: en un clon parcial
+    /// cualquier comando que lea un objeto ausente (<c>cherry</c>,
+    /// <c>branch &lt;rama&gt; &lt;sha&gt;</c>, <c>rev-parse &lt;sha&gt;^{commit}</c>,
+    /// <c>log</c>...) dispara un lazy fetch que ejecuta el
+    /// <c>remote.&lt;promisor&gt;.uploadpack</c> del repositorio.</item>
+    /// <item><see cref="EnsureNoDangerousConfiguredHooksAsync"/>: la config del
+    /// repositorio puede definir un hook (git &gt;= 2.54) para un evento que
+    /// GitSweep dispara (p. ej. <c>reference-transaction</c>), que
+    /// <c>core.hooksPath</c> no gobierna.</item>
+    /// </list>
+    /// Solo <see cref="ExecuteObjectFreeGitCommandAsync"/> las omite.
     /// </summary>
     private async Task<(int ExitCode, string Output, string Error)> RunRepositoryGitCommandAsync(
         string workingDirectory,
@@ -956,6 +1866,7 @@ public class GitRepositoryService : IGitRepositoryService
         IReadOnlyDictionary<string, string>? environmentVariables)
     {
         await EnsureNotPartialCloneAsync(workingDirectory, ct);
+        await EnsureNoDangerousConfiguredHooksAsync(workingDirectory, ct);
         return await RunGitProcessAsync(
             workingDirectory,
             arguments,
@@ -967,11 +1878,13 @@ public class GitRepositoryService : IGitRepositoryService
     }
 
     /// <summary>
-    /// Ejecuta un comando SIN la guarda de clon parcial. Reservado a los dos
-    /// comandos que nunca leen objetos y que hacen falta antes o para la
-    /// guarda: localizar el repositorio (<c>rev-parse --git-dir</c>) y la
-    /// propia detección (<c>config --get-regexp</c>). Ninguno puede disparar
-    /// un lazy fetch: no se resuelve ningún objeto.
+    /// Ejecuta un comando SIN las guardas de <see cref="RunRepositoryGitCommandAsync"/>.
+    /// Reservado a los comandos que nunca leen objetos y que hacen falta antes
+    /// o para las propias guardas: localizar el repositorio
+    /// (<c>rev-parse --git-dir</c>), detectar el clon parcial y listar los
+    /// hooks configurados (ambos <c>config --get-regexp</c>). Ninguno puede
+    /// disparar un lazy fetch ni correría un hook por una actualización de ref:
+    /// no se resuelve ningún objeto ni se toca ninguna ref.
     /// </summary>
     private Task<(int ExitCode, string Output, string Error)> ExecuteObjectFreeGitCommandAsync(
         string workingDirectory, string[] arguments, CancellationToken ct) =>
@@ -1056,6 +1969,172 @@ public class GitRepositoryService : IGitRepositoryService
     // Clave del memo: la ruta completa normalizada del directorio de trabajo.
     private static string PartialCloneMemoKey(string workingDirectory) =>
         Path.TrimEndingDirectorySeparator(Path.GetFullPath(workingDirectory));
+
+    // Eventos de hook que GitSweep NO puede disparar con ninguno de sus
+    // comandos: solo los disparan git commit/merge/am/rebase/checkout/switch/
+    // push/receive-pack/send-email/p4, que GitSweep nunca ejecuta. Lista
+    // blanca con denegación por defecto (RG-01): un evento configurado que no
+    // esté aquí hace rechazar el repositorio. Por eso NO están, a propósito:
+    // reference-transaction y pre-auto-gc (los que GitSweep dispara),
+    // post-index-change y fsmonitor-watchman (relacionados con el índice/
+    // fsmonitor, por prudencia) y cualquier evento desconocido o futuro.
+    // Tomada de githooks(5) de git 2.54/2.55.
+    private static readonly HashSet<string> HarmlessHookEvents = new(StringComparer.Ordinal)
+    {
+        "applypatch-msg", "pre-applypatch", "post-applypatch",
+        "pre-commit", "pre-merge-commit", "prepare-commit-msg", "commit-msg", "post-commit",
+        "pre-rebase", "post-checkout", "post-merge", "pre-push", "post-rewrite",
+        "pre-receive", "update", "proc-receive", "post-receive", "post-update", "push-to-checkout",
+        "sendemail-validate",
+        "p4-changelist", "p4-prepare-changelist", "p4-post-changelist", "p4-pre-submit"
+    };
+
+    // Lista cada clave que ENLAZA un hook a un evento en la config efectiva
+    // (incluye include.path/includeIf, como git). `(.*\.)?` cubre las tres
+    // formas que git enlaza (RG2-01): sin subsección (`[hook] event`, clave
+    // `hook.event`), con subsección vacía (`[hook ""] event`, clave
+    // `hook..event`) y con un nombre amistoso cualquiera, con puntos o caja
+    // propia (`hook.<nombre>.event`). Igual que PartialCloneConfigRegex con
+    // `(.*\.)?` para OBS-R1. Es de solo lectura y no resuelve objetos.
+    private const string ConfiguredHookEventRegex = @"^hook\.(.*\.)?event$";
+
+    // Tope de nombres de evento que se citan en el mensaje de rechazo: una
+    // config hostil puede declarar miles (RG2-O1/M-7); el resto se resume como
+    // «and N more».
+    private const int MaxReportedHookEvents = 5;
+
+    // Rutas ya verificadas sin hooks configurados peligrosos: se comprueba una
+    // vez por repositorio, no una por comando (se olvida tras cada fetch, el
+    // único comando que podría dejar config nueva). Solo se memoriza el
+    // resultado seguro; un rechazo se vuelve a evaluar.
+    private readonly ConcurrentDictionary<string, bool> _verifiedNoDangerousConfiguredHooks =
+        new(OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
+
+    /// <summary>
+    /// Falla cerrado (lanza <see cref="RepositoryHookNotSupportedException"/>)
+    /// si la configuración del repositorio define un hook por configuración
+    /// (git &gt;= 2.54) para un evento que GitSweep puede disparar, o si no se
+    /// puede leer la lista de eventos. Independiente de la versión de git y de
+    /// cualquier semántica de <c>hook.*.enabled</c> (RG-01/RR-1): se decide solo
+    /// por el nombre del evento, nunca por el valor del comando, y nunca se
+    /// construyen argumentos <c>-c</c> a partir de texto del repositorio.
+    /// </summary>
+    private async Task EnsureNoDangerousConfiguredHooksAsync(string workingDirectory, CancellationToken ct)
+    {
+        var key = PartialCloneMemoKey(workingDirectory);
+        if (_verifiedNoDangerousConfiguredHooks.ContainsKey(key))
+        {
+            return;
+        }
+
+        var result = await ExecuteObjectFreeGitCommandAsync(
+            workingDirectory, ["config", "-z", "--get-regexp", ConfiguredHookEventRegex], ct);
+
+        // Un fallo por límite deja la respuesta indeterminada: fallar cerrado.
+        ThrowIfLimitFailure(result);
+
+        var refusal = ClassifyConfiguredHookEvents(result.ExitCode, result.Output);
+        if (refusal is null)
+        {
+            _verifiedNoDangerousConfiguredHooks.TryAdd(key, true);
+            return;
+        }
+
+        throw new RepositoryHookNotSupportedException(refusal);
+    }
+
+    /// <summary>
+    /// Clasifica la salida de <c>git config -z --get-regexp</c> con
+    /// <see cref="ConfiguredHookEventRegex"/>: <c>null</c> si no hay ningún hook
+    /// configurado para un evento que GitSweep pueda disparar; si no, el mensaje
+    /// (en inglés) del rechazo, que nombra el/los evento(s) saneados y nunca el
+    /// valor del comando. Falla cerrado ante cualquier salida inesperada.
+    /// </summary>
+    /// <param name="exitCode">1 = ninguna clave de evento de hook (nada que
+    /// revisar); 0 = hubo coincidencias; cualquier otro código es
+    /// indeterminado.</param>
+    /// <param name="output">Registros separados por NUL: <c>clave LF valor</c>,
+    /// o solo <c>clave</c> si no tiene valor.</param>
+    internal static string? ClassifyConfiguredHookEvents(int exitCode, string output)
+    {
+        if (exitCode == 1)
+        {
+            return null;
+        }
+
+        const string unreadable =
+            "GitSweep could not read the repository's configured git hooks (hook.<name>.event); refusing to continue.";
+        if (exitCode != 0)
+        {
+            return unreadable;
+        }
+
+        var records = output.Split('\0', StringSplitOptions.RemoveEmptyEntries);
+        if (records.Length == 0)
+        {
+            // Un 0 promete al menos una coincidencia: salida inesperada.
+            return unreadable;
+        }
+
+        var dangerousEvents = new List<string>();
+        foreach (var record in records)
+        {
+            var newline = record.IndexOf('\n');
+            // Una clave sin valor (`[hook "x"] event` a secas) no nombra ningún
+            // evento conocido, pero es config de hook inesperada: fallar cerrado.
+            var value = newline < 0 ? string.Empty : record[(newline + 1)..];
+            var eventName = value.Trim();
+            if (HarmlessHookEvents.Contains(eventName))
+            {
+                continue;
+            }
+
+            var display = SanitizeHookEventName(eventName);
+            if (!dangerousEvents.Contains(display, StringComparer.Ordinal))
+            {
+                dangerousEvents.Add(display);
+            }
+        }
+
+        if (dangerousEvents.Count == 0)
+        {
+            return null;
+        }
+
+        // Acota la lista de nombres: una config hostil puede declarar miles.
+        var shown = dangerousEvents.Take(MaxReportedHookEvents).ToList();
+        var listed = string.Join(", ", shown);
+        if (dangerousEvents.Count > shown.Count)
+        {
+            listed += $", and {(dangerousEvents.Count - shown.Count).ToString(CultureInfo.InvariantCulture)} more";
+        }
+
+        return
+            "The repository configuration defines a git hook (hook.<name>.command) for an event GitSweep does not " +
+            $"allow because its own commands could trigger it: {listed}. Such a hook runs a program chosen by the " +
+            "repository, and core.hooksPath does not disable it, so GitSweep refuses to run any git command here. " +
+            "Remove the hook.<name>.event / hook.<name>.command settings for that event, or run GitSweep elsewhere.";
+    }
+
+    // Nombre de evento para el mensaje: solo letras ASCII, dígitos, '.', '_' y
+    // '-' (todos los nombres de evento reales lo son); cualquier otro carácter
+    // del texto del repositorio se sustituye por '?', y la longitud se acota.
+    // El mensaje además pasa por el saneo de terminal de la CLI.
+    private static string SanitizeHookEventName(string value)
+    {
+        if (value.Length == 0)
+        {
+            return "(empty)";
+        }
+
+        var builder = new StringBuilder(value.Length);
+        foreach (var c in value.Length > 64 ? value[..64] : value)
+        {
+            builder.Append(char.IsAsciiLetterOrDigit(c) || c is '.' or '_' or '-' ? c : '?');
+        }
+
+        return builder.ToString();
+    }
 
     internal enum PartialCloneConfigStatus
     {
@@ -1291,7 +2370,10 @@ public class GitRepositoryService : IGitRepositoryService
     /// Entorno endurecido del proceso git hijo (se aplica sobre una copia del
     /// entorno del proceso actual): quita las variables de git heredadas,
     /// reduce PATH a sus entradas totalmente cualificadas y fuerza
-    /// <c>GIT_TERMINAL_PROMPT=0</c> y <c>GIT_PAGER=cat</c>.
+    /// <c>GIT_TERMINAL_PROMPT=0</c>, <c>GIT_PAGER=cat</c>,
+    /// <c>GIT_NO_LAZY_FETCH=1</c>, la lista de transportes permitidos
+    /// (<c>GIT_ALLOW_PROTOCOL</c>), un <c>GIT_PROXY_COMMAND</c> vacío y un
+    /// fichero de grafts vacío (<c>GIT_GRAFT_FILE</c>).
     /// </summary>
     internal static void ApplyHardenedEnvironment(IDictionary<string, string?> environment, bool isWindows)
     {
@@ -1350,6 +2432,29 @@ public class GitRepositoryService : IGitRepositoryService
         // profundidad: el control principal es que el ejecutor se niega a correr
         // cualquier comando contra un clon parcial (EnsureNotPartialCloneAsync).
         environment["GIT_NO_LAZY_FETCH"] = "1";
+
+        // P1b-01: una clave protocol.<nombre>.allow=always del repositorio
+        // tiene prioridad sobre el protocol.allow=never fijado con -c (la clave
+        // por protocolo gana a la genérica, sea cual sea el fichero), así que
+        // `<x>::<url>` (o remote.<url>.vcs, o un insteadOf hacia él) volvía a
+        // ejecutar `git remote-<x>`, y con un `alias.remote-<x> = !<cmd>` del
+        // repositorio, un comando de shell. GIT_ALLOW_PROTOCOL se impone a
+        // toda la configuración (git(1)): solo quedan los transportes
+        // estándar.
+        environment["GIT_ALLOW_PROTOCOL"] = AllowedProtocols;
+
+        // P1b-02: core.gitProxy es «gana la primera coincidencia», así que el
+        // valor del repositorio se lee antes que el -c core.gitProxy= y ganaba:
+        // cada conexión git:// ejecutaba el programa que eligió el
+        // repositorio. Con GIT_PROXY_COMMAND definida git ni siquiera mira
+        // core.gitProxy, y vacía significa «sin proxy».
+        environment["GIT_PROXY_COMMAND"] = string.Empty;
+
+        // I5: el fichero de grafts del repositorio (info/grafts) inventa padres
+        // de commits. Apuntar GIT_GRAFT_FILE al dispositivo nulo lo sustituye
+        // por un fichero siempre vacío (el aviso de git al abrirlo lo calla
+        // advice.graftFileDeprecated=false).
+        environment["GIT_GRAFT_FILE"] = NullDevicePath;
     }
 
     // Lee un flujo del hijo acumulando como mucho maxChars caracteres.

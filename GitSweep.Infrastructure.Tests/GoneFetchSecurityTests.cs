@@ -169,48 +169,9 @@ public sealed class GoneFetchSecurityTests : IAsyncLifetime
         Assert.True(await _sut.BranchExistsAsync(_repoPath, "feature/victim"));
     }
 
-    [Fact]
-    public async Task FetchPrune_does_not_execute_remote_helper_transport()
-    {
-        // A remote URL of the form `foo::bar` (or any non-built-in scheme)
-        // makes git run a `git-remote-foo` program found on PATH. With the
-        // protocol allowlist the transport is refused before any helper
-        // can run, so the marker file is never created.
-        var fakeBin = Path.Combine(_root, "fake-bin");
-        Directory.CreateDirectory(fakeBin);
-        var marker = Path.Combine(_root, "remote-helper-owned.txt");
-        await TestScripts.WriteExecutableAsync(
-            Path.Combine(fakeBin, "git-remote-foo"),
-            $"#!/bin/sh\necho owned > {marker.Replace('\\', '/')}\nexit 1\n");
-        var repo = Path.Combine(_root, "hostile-helper");
-        Directory.CreateDirectory(repo);
-        await RunGitAsync(repo, "init", "-b", "main");
-        await RunGitAsync(repo, "remote", "add", "origin", "foo::bar");
-
-        var originalPath = Environment.GetEnvironmentVariable("PATH");
-        try
-        {
-            Environment.SetEnvironmentVariable("PATH", fakeBin + Path.PathSeparator + originalPath);
-
-            // Positive control: with the same PATH, plain git does run the
-            // `git-remote-foo` helper. The script exits 1, so `ls-remote`
-            // fails at once without touching the network. Without this proof
-            // a helper git cannot run would make the assertion below pass
-            // vacuously. Kept inside this try/finally: PATH is process-wide.
-            await Assert.ThrowsAsync<InvalidOperationException>(() => RunGitAsync(repo, "ls-remote", "origin"));
-            Assert.True(File.Exists(marker), "plain `git ls-remote` did not run the planted git-remote-foo helper");
-            File.Delete(marker);
-
-            var fetch = await _sut.FetchPruneAsync(repo);
-
-            Assert.False(fetch.Success);
-            Assert.False(File.Exists(marker), "remote-helper transport program was executed");
-        }
-        finally
-        {
-            Environment.SetEnvironmentVariable("PATH", originalPath);
-        }
-    }
+    // FetchPrune_does_not_execute_remote_helper_transport changes this
+    // process's PATH, so it lives in RemoteHelperTransportTests (below), in
+    // the non-parallel ProcessEnvironmentCollection.
 
     [Fact]
     public async Task FetchPrune_fails_closed_when_origin_is_not_configured()
@@ -270,6 +231,91 @@ public sealed class GoneFetchSecurityTests : IAsyncLifetime
         await File.WriteAllTextAsync(Path.Combine(_repoPath, fileName), content);
         await RunGitAsync(_repoPath, "add", ".");
         await RunGitAsync(_repoPath, "commit", "-m", message, "--no-gpg-sign");
+    }
+
+    private static async Task<string> RunGitAsync(string workingDirectory, params string[] arguments)
+    {
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = "git",
+            WorkingDirectory = workingDirectory,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+        foreach (var argument in arguments) startInfo.ArgumentList.Add(argument);
+        using var process = new Process { StartInfo = startInfo };
+        process.Start();
+        var stdout = await process.StandardOutput.ReadToEndAsync();
+        var stderr = await process.StandardError.ReadToEndAsync();
+        await process.WaitForExitAsync();
+        if (process.ExitCode != 0)
+            throw new InvalidOperationException($"git {string.Join(' ', arguments)} failed: {stderr}{stdout}");
+        return stdout;
+    }
+}
+
+/// <summary>
+/// Prepends a directory to this process's PATH, which every git child of the
+/// process (GitSweep's and other tests' raw helpers) would observe while it
+/// is set, so it lives in the non-parallel
+/// <see cref="ProcessEnvironmentCollection"/>.
+/// </summary>
+[Collection(nameof(ProcessEnvironmentCollection))]
+public sealed class RemoteHelperTransportTests : IDisposable
+{
+    private readonly string _root = Path.Combine(Path.GetTempPath(), "GitSweepTests", Guid.NewGuid().ToString("N"));
+    private readonly GitRepositoryService _sut = new();
+
+    public RemoteHelperTransportTests() => Directory.CreateDirectory(_root);
+
+    public void Dispose()
+    {
+        try { if (Directory.Exists(_root)) Directory.Delete(_root, recursive: true); } catch { }
+    }
+
+    [Fact]
+    public async Task FetchPrune_does_not_execute_remote_helper_transport()
+    {
+        // A remote URL of the form `foo::bar` (or any non-built-in scheme)
+        // makes git run a `git-remote-foo` program found on PATH. With the
+        // protocol allowlist the transport is refused before any helper
+        // can run, so the marker file is never created.
+        var fakeBin = Path.Combine(_root, "fake-bin");
+        Directory.CreateDirectory(fakeBin);
+        var marker = Path.Combine(_root, "remote-helper-owned.txt");
+        await TestScripts.WriteExecutableAsync(
+            Path.Combine(fakeBin, "git-remote-foo"),
+            $"#!/bin/sh\necho owned > {marker.Replace('\\', '/')}\nexit 1\n");
+        var repo = Path.Combine(_root, "hostile-helper");
+        Directory.CreateDirectory(repo);
+        await RunGitAsync(repo, "init", "-b", "main");
+        await RunGitAsync(repo, "remote", "add", "origin", "foo::bar");
+
+        var originalPath = Environment.GetEnvironmentVariable("PATH");
+        try
+        {
+            Environment.SetEnvironmentVariable("PATH", fakeBin + Path.PathSeparator + originalPath);
+
+            // Positive control: with the same PATH, plain git does run the
+            // `git-remote-foo` helper. The script exits 1, so `ls-remote`
+            // fails at once without touching the network. Without this proof
+            // a helper git cannot run would make the assertion below pass
+            // vacuously. Kept inside this try/finally: PATH is process-wide.
+            await Assert.ThrowsAsync<InvalidOperationException>(() => RunGitAsync(repo, "ls-remote", "origin"));
+            Assert.True(File.Exists(marker), "plain `git ls-remote` did not run the planted git-remote-foo helper");
+            File.Delete(marker);
+
+            var fetch = await _sut.FetchPruneAsync(repo);
+
+            Assert.False(fetch.Success);
+            Assert.False(File.Exists(marker), "remote-helper transport program was executed");
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("PATH", originalPath);
+        }
     }
 
     private static async Task<string> RunGitAsync(string workingDirectory, params string[] arguments)

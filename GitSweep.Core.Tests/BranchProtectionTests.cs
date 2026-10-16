@@ -165,4 +165,20 @@ public class BranchProtectionTests
         Assert.True(_sut.Evaluate("-bad", GitSweepConfig.Empty, null, []).IsProtected);
         Assert.True(_sut.Evaluate("", GitSweepConfig.Empty, null, []).IsProtected);
     }
+
+    // P5-T2 (final-coverage-review.md): a valid pattern can still backtrack for
+    // far longer than the matcher's 250 ms timeout. The matcher must throw
+    // (no filtered catch in clean takes it, so clean stops before any delete)
+    // instead of answering "not protected".
+    [Fact]
+    public void GlobMatcher_backtracking_pattern_hits_the_timeout_and_throws_instead_of_answering()
+    {
+        var pattern = string.Concat(Enumerable.Repeat("*a", 14)) + "*b";
+        Assert.True(BranchGlobMatcher.IsValidPattern(pattern));
+        var branch = new string('a', 100);
+
+        Assert.Throws<System.Text.RegularExpressions.RegexMatchTimeoutException>(() => BranchGlobMatcher.IsMatch(branch, pattern));
+        Assert.Throws<System.Text.RegularExpressions.RegexMatchTimeoutException>(
+            () => _sut.Evaluate(branch, new GitSweepConfig([pattern]), null, []));
+    }
 }

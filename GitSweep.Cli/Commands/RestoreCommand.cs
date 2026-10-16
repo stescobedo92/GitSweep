@@ -156,14 +156,18 @@ public sealed class RestoreCommand : AsyncCommand<RestoreCommand.Settings>
                             _console.MarkupLine(
                                 $"[green]Restored[/] '[blue]{TerminalText.Markup(entry.BranchName)}[/]' at [grey]{TerminalText.Markup(TrashRestoreHelper.ShortSha(entry.CommitSha))}[/].");
                             break;
+                        case TrashRestoreHelper.RestoreOutcome.AlreadyRestored:
+                            restored++;
+                            _console.MarkupLine($"[green]{TerminalText.Markup(result.Message)}[/]");
+                            break;
                         case TrashRestoreHelper.RestoreOutcome.AlreadyExists:
-                            failures.Add(result.ErrorMessage!);
-                            _console.MarkupLine($"[yellow]{TerminalText.Markup(result.ErrorMessage)}[/]");
+                            failures.Add(result.Message!);
+                            _console.MarkupLine($"[yellow]{TerminalText.Markup(result.Message)}[/]");
                             break;
                         default:
-                            failures.Add($"'{entry.BranchName}': {result.ErrorMessage}");
+                            failures.Add($"'{entry.BranchName}': {result.Message}");
                             _console.MarkupLine(
-                                $"[red]Failed to restore '[blue]{TerminalText.Markup(entry.BranchName)}[/]':[/] {TerminalText.Markup(result.ErrorMessage ?? "unknown error", allowNewlines: true)}");
+                                $"[red]Failed to restore '[blue]{TerminalText.Markup(entry.BranchName)}[/]':[/] {TerminalText.Markup(result.Message ?? "unknown error", allowNewlines: true)}");
                             break;
                     }
 

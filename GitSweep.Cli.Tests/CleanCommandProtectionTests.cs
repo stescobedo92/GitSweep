@@ -124,6 +124,43 @@ public sealed class CleanCommandProtectionTests
     }
 
     [Fact]
+    public async Task Clean_uses_exactly_the_unprotected_list_even_when_nothing_is_reported_protected()
+    {
+        // O12: clean used to replace the unprotected list with every branch
+        // whenever no branch was reported protected. FilterProtected already
+        // returns every unprotected branch, so that fallback could only ever
+        // widen the candidates past what the protection service allowed
+        // (fail-open shape). Here the service excludes the only branch
+        // without reporting it as protected: nothing may be analyzed or
+        // deleted.
+        var console = new TestConsole();
+        var branches = new List<BranchInfo> { new("feature/merged", DateTime.UtcNow, true) };
+        SetupBranches(branches, GitSweepConfig.Default, "main", ["main"]);
+        _trashService.SaveAsync("/some/repo", Arg.Any<string>(), Arg.Any<string>(), Arg.Any<Guid>(), Arg.Any<CancellationToken>())
+            .Returns(ci => new TrashEntry(Guid.NewGuid().ToString("N"), (string)ci[1], Sha, DateTimeOffset.UtcNow, Guid.NewGuid()));
+        _gitService.DeleteBranchAsync("/some/repo", Arg.Any<string>(), Arg.Any<CancellationToken>()).Returns((true, string.Empty));
+        var protection = Substitute.For<IBranchProtectionService>();
+        protection.FilterProtected(default!, default!, default, default, out _)
+            .ReturnsForAnyArgs(ci =>
+            {
+                ci[4] = new List<BranchInfo>();
+                return new List<BranchProtectionResult>();
+            });
+        protection.Evaluate(default!, default!, default, default)
+            .ReturnsForAnyArgs(ci => BranchProtectionResult.NotProtected((string)ci[0]));
+        var command = new CleanCommand(_gitService, _analyzer, _trashService, new BranchRiskClassifier(),
+            _configService, protection, console);
+
+        var settings = new CleanCommand.Settings { Path = "/some/repo", SelectAll = true, ConfirmDeletion = true };
+        var result = await command.ExecuteForTestAsync(CreateContext(), settings, CancellationToken.None);
+
+        Assert.Equal(0, result);
+        Assert.Contains("No stale or merged branches found", console.Output);
+        _analyzer.Received().IdentifyMergedBranches(Arg.Is<IReadOnlyList<BranchInfo>>(list => list.Count == 0));
+        await _gitService.DidNotReceive().DeleteBranchAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
     public async Task Invalid_config_fails_closed_and_deletes_nothing()
     {
         var console = new TestConsole();

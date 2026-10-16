@@ -70,6 +70,29 @@ public sealed class TrashCommandsTests
         Assert.Contains("already exists", console.Output);
     }
 
+    // RR-3: when the branch is already back at the saved SHA but RemoveAsync
+    // reports false (file gone, invalid id, unresolvable dir), the message must
+    // not claim the entry was removed.
+    [Fact]
+    public async Task Restore_when_branch_already_at_saved_sha_and_remove_fails_says_no_longer_needed()
+    {
+        var console = new TestConsole();
+        var entry = Entry("feature/login", ShaA, Guid.NewGuid());
+        SetupRepo([entry]);
+        _gitService.BranchExistsAsync("/some/repo", "feature/login", Arg.Any<CancellationToken>()).Returns(true);
+        _gitService.GetBranchTipShaAsync("/some/repo", "feature/login", Arg.Any<CancellationToken>()).Returns(ShaA);
+        _trashService.RemoveAsync("/some/repo", entry.Id, Arg.Any<CancellationToken>()).Returns(false);
+        var command = new RestoreCommand(_gitService, _trashService, console);
+        var settings = new RestoreCommand.Settings { Path = "/some/repo", Branch = "feature/login", ConfirmRestore = true };
+
+        var result = await command.ExecuteForTestAsync(CreateContext("restore"), settings, CancellationToken.None);
+
+        Assert.Equal(0, result);
+        Assert.Contains("no longer needed", console.Output);
+        Assert.DoesNotContain("was removed", console.Output);
+        await _gitService.DidNotReceive().CreateBranchAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<string>(), Arg.Any<CancellationToken>());
+    }
+
     [Fact]
     public async Task Restore_returns_1_when_named_branch_is_not_in_trash()
     {

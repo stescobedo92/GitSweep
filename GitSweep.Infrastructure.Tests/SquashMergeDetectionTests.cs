@@ -235,37 +235,9 @@ public sealed class SquashMergeDetectionTests : IAsyncLifetime
         Assert.Equal(looseBefore, await CountLooseObjectsAsync());
     }
 
-    [Fact]
-    public async Task Injected_git_config_environment_does_not_apply()
-    {
-        await RunGitAsync("checkout", "-b", "feature/squash");
-        await CommitFileAsync("squash.txt", "squashed", "squashed work");
-        await RunGitAsync("checkout", "main");
-        await RunGitAsync("merge", "--squash", "feature/squash");
-        await RunGitAsync("commit", "-m", "squash merge feature/squash", "--no-gpg-sign");
-
-        // GIT_CONFIG_* variables inject config at command-line precedence
-        // into every git child process. The service must strip them, so this
-        // hostile signing setup can neither break nor hijack the scan.
-        Environment.SetEnvironmentVariable("GIT_CONFIG_COUNT", "2");
-        Environment.SetEnvironmentVariable("GIT_CONFIG_KEY_0", "commit.gpgsign");
-        Environment.SetEnvironmentVariable("GIT_CONFIG_VALUE_0", "true");
-        Environment.SetEnvironmentVariable("GIT_CONFIG_KEY_1", "gpg.program");
-        Environment.SetEnvironmentVariable("GIT_CONFIG_VALUE_1", "nonexistent-gitsweep-test-program");
-        try
-        {
-            var detected = await _sut.IsSquashOrRebaseMergedAsync(_repoPath, "main", "feature/squash");
-            Assert.True(detected);
-        }
-        finally
-        {
-            Environment.SetEnvironmentVariable("GIT_CONFIG_COUNT", null);
-            Environment.SetEnvironmentVariable("GIT_CONFIG_KEY_0", null);
-            Environment.SetEnvironmentVariable("GIT_CONFIG_VALUE_0", null);
-            Environment.SetEnvironmentVariable("GIT_CONFIG_KEY_1", null);
-            Environment.SetEnvironmentVariable("GIT_CONFIG_VALUE_1", null);
-        }
-    }
+    // Injected_git_config_environment_does_not_apply changes this process's
+    // environment, so it lives in InjectedGitConfigEnvironmentTests (below),
+    // in the non-parallel ProcessEnvironmentCollection.
 
     [Fact]
     public async Task Repository_auto_gc_hook_is_not_executed_during_scan()
@@ -426,6 +398,108 @@ public sealed class SquashMergeDetectionTests : IAsyncLifetime
             throw new InvalidOperationException($"git {string.Join(' ', arguments)} failed: {stderr}{stdout}");
         }
 
+        return stdout;
+    }
+}
+
+/// <summary>
+/// GIT_CONFIG_* variables inject config at command-line precedence into every
+/// git child of this process, not only GitSweep's: while they are set, the raw
+/// git helpers of every other test inherit them, and a partial set (COUNT
+/// before its keys and values) makes any git command die with "missing config
+/// key ... unable to parse command-line config". Run in parallel with the
+/// rest of the suite, this test broke other tests' setup at random, so it
+/// lives in the non-parallel <see cref="ProcessEnvironmentCollection"/>.
+/// </summary>
+[Collection(nameof(ProcessEnvironmentCollection))]
+public sealed class InjectedGitConfigEnvironmentTests : IAsyncLifetime
+{
+    private readonly string _repoPath = Path.Combine(Path.GetTempPath(), "GitSweepTests", Guid.NewGuid().ToString("N"));
+    private readonly GitRepositoryService _sut = new();
+
+    public async Task InitializeAsync()
+    {
+        Directory.CreateDirectory(_repoPath);
+        try
+        {
+            await RunGitAsync("init", "-b", "main");
+        }
+        catch (InvalidOperationException)
+        {
+            await RunGitAsync("init");
+            await RunGitAsync("checkout", "-b", "main");
+        }
+
+        await RunGitAsync("config", "user.email", "tests@example.com");
+        await RunGitAsync("config", "user.name", "GitSweep Tests");
+        await CommitFileAsync("README.md", "initial", "initial commit");
+    }
+
+    public Task DisposeAsync()
+    {
+        try { if (Directory.Exists(_repoPath)) Directory.Delete(_repoPath, recursive: true); } catch { }
+        return Task.CompletedTask;
+    }
+
+    [Fact]
+    public async Task Injected_git_config_environment_does_not_apply()
+    {
+        await RunGitAsync("checkout", "-b", "feature/squash");
+        await CommitFileAsync("squash.txt", "squashed", "squashed work");
+        await RunGitAsync("checkout", "main");
+        await RunGitAsync("merge", "--squash", "feature/squash");
+        await RunGitAsync("commit", "-m", "squash merge feature/squash", "--no-gpg-sign");
+
+        // GIT_CONFIG_* variables inject config at command-line precedence
+        // into every git child process. The service must strip them, so this
+        // hostile signing setup can neither break nor hijack the scan. The
+        // count is set last and cleared first, so the set is never partial.
+        Environment.SetEnvironmentVariable("GIT_CONFIG_KEY_0", "commit.gpgsign");
+        Environment.SetEnvironmentVariable("GIT_CONFIG_VALUE_0", "true");
+        Environment.SetEnvironmentVariable("GIT_CONFIG_KEY_1", "gpg.program");
+        Environment.SetEnvironmentVariable("GIT_CONFIG_VALUE_1", "nonexistent-gitsweep-test-program");
+        Environment.SetEnvironmentVariable("GIT_CONFIG_COUNT", "2");
+        try
+        {
+            var detected = await _sut.IsSquashOrRebaseMergedAsync(_repoPath, "main", "feature/squash");
+            Assert.True(detected);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("GIT_CONFIG_COUNT", null);
+            Environment.SetEnvironmentVariable("GIT_CONFIG_KEY_0", null);
+            Environment.SetEnvironmentVariable("GIT_CONFIG_VALUE_0", null);
+            Environment.SetEnvironmentVariable("GIT_CONFIG_KEY_1", null);
+            Environment.SetEnvironmentVariable("GIT_CONFIG_VALUE_1", null);
+        }
+    }
+
+    private async Task CommitFileAsync(string fileName, string content, string message)
+    {
+        await File.WriteAllTextAsync(Path.Combine(_repoPath, fileName), content);
+        await RunGitAsync("add", ".");
+        await RunGitAsync("commit", "-m", message, "--no-gpg-sign");
+    }
+
+    private async Task<string> RunGitAsync(params string[] arguments)
+    {
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = "git",
+            WorkingDirectory = _repoPath,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+        foreach (var argument in arguments) startInfo.ArgumentList.Add(argument);
+        using var process = new Process { StartInfo = startInfo };
+        process.Start();
+        var stdout = await process.StandardOutput.ReadToEndAsync();
+        var stderr = await process.StandardError.ReadToEndAsync();
+        await process.WaitForExitAsync();
+        if (process.ExitCode != 0)
+            throw new InvalidOperationException($"git {string.Join(' ', arguments)} failed: {stderr}{stdout}");
         return stdout;
     }
 }
