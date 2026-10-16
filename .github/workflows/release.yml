@@ -1,117 +1,589 @@
 name: Release
 
+# Flow: version -> build (tests run once, every package is built once) -> tag
+# (only for a new version, before anything is published) -> publish-nuget and
+# publish-npm (both idempotent) -> github-release (after NuGet, independent of npm).
+#
+# Every job can be re-run, and "Run workflow" with an existing tag republishes
+# whatever channel is still missing for that tag. A republish stops before
+# building when nuget.org (nuspec repository commit) or npm (gitHead) already
+# holds that version from a different commit.
+#
+# Values that come from inputs, events or job outputs never appear inside a
+# `run:` script; they are passed through `env:` and validated in the script.
+
 on:
   push:
     branches:
       - master
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing vX.Y.Z tag to (re)publish. Leave empty to release the next version from master.
+        required: false
+        type: string
+        default: ""
 
-permissions:
-  contents: write
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
-  prepare-release:
+  version:
+    name: Compute version
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
     outputs:
-      release_created: ${{ steps.version.outputs.release_created }}
-      tag_name: ${{ steps.version.outputs.tag_name }}
+      release: ${{ steps.version.outputs.release }}
       version: ${{ steps.version.outputs.version }}
+      tag_name: ${{ steps.version.outputs.tag_name }}
+      sha: ${{ steps.version.outputs.sha }}
+      new_tag: ${{ steps.version.outputs.new_tag }}
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
-      - name: Calculate next SemVer
+      - name: Determine release
         id: version
-        shell: bash
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
+          shopt -s inherit_errexit
 
-          latest_tag="$(git tag --list 'v[0-9]*' --sort=-v:refname | head -n 1)"
-          if [ -z "${latest_tag}" ]; then
-            base_version="0.0.0"
-            commit_range="HEAD"
+          # Strict SemVer core, no leading zeros, so a tag can never name a
+          # version that NuGet would normalize to a different string.
+          readonly tag_re='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          readonly sha_re='^[0-9a-f]{40}$'
+          readonly nuget_id='gitsweep.cli'
+          readonly nuget_base="https://api.nuget.org/v3-flatcontainer/${nuget_id}"
+          readonly npm_package='@stescobedo9205/gitsweep-cli'
+
+          fail() {
+            printf '::error::%s\n' "$*"
+            exit 1
+          }
+
+          # Shows a tool's diagnostics with a prefix, so no line of it can be
+          # read by the runner as a workflow command.
+          show() {
+            sed -n -e '1,40s/^/  | /p' -- "$1"
+          }
+
+          emit() {
+            printf '%s=%s\n' "$1" "$2" >> "$GITHUB_OUTPUT"
+          }
+
+          # Strict vX.Y.Z tags (extra arguments go to `git tag --list`), highest first.
+          release_tags() {
+            local all
+            all="$(git tag --list "$@" 'v[0-9]*')"
+            if [ -z "$all" ]; then
+              return 0
+            fi
+            printf '%s\n' "$all" | { grep -E "$tag_re" || [ "$?" -eq 1 ]; } | sort -rV
+          }
+
+          # GET from nuget.org into $2. Sets curl_rc and http_status; callers
+          # accept only curl_rc=0 with HTTP 200.
+          nuget_get() {
+            curl_rc=0
+            http_status="$(curl --silent --show-error --fail-with-body \
+              --proto '=https' --tlsv1.2 --retry 3 --max-time 60 --max-filesize 1048576 \
+              --output "$2" --write-out '%{http_code}' \
+              "$1")" || curl_rc=$?
+          }
+
+          # Sets nuget_state to present or absent. GitSweep.Cli exists on
+          # nuget.org, so anything but a 200 with a versions array (404 of the
+          # whole package, network error, 5xx, odd body) fails.
+          check_nuget() {
+            local version="$1" body jq_rc=0
+            body="$(mktemp)"
+            nuget_get "${nuget_base}/index.json" "$body"
+            if [ "$curl_rc" -ne 0 ] || [ "$http_status" != "200" ]; then
+              fail "Could not read the ${nuget_id} index on nuget.org (curl exit ${curl_rc}, HTTP ${http_status}); refusing to guess whether ${version} is published."
+            fi
+
+            jq -e --arg v "$version" \
+              'if (.versions | type) == "array" then any(.versions[]; . == $v) else error("no versions array") end' \
+              "$body" > /dev/null || jq_rc=$?
+            case "$jq_rc" in
+              0) nuget_state=present ;;
+              1) nuget_state=absent ;;
+              *) fail "Unexpected response from ${nuget_base}/index.json; refusing to guess whether ${version} is published." ;;
+            esac
+          }
+
+          # Prints the commit attribute of the single <repository> element of
+          # a nuspec; exits non-zero when it cannot be parsed or is ambiguous.
+          # A nuspec has no DTD, entities or comments, so any "<!" is refused
+          # before parsing: nothing in the document can expand or be fetched.
+          nuspec_commit() {
+            python3 -I - "$1" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          with open(sys.argv[1], "rb") as f:
+              data = f.read(1048577)
+          if len(data) > 1048576 or b"<!" in data:
+              sys.exit(4)
+          root = ET.fromstring(data)
+          repos = [e for e in root.iter() if isinstance(e.tag, str) and e.tag.rsplit("}", 1)[-1] == "repository"]
+          if len(repos) != 1 or not repos[0].get("commit"):
+              sys.exit(3)
+          print(repos[0].get("commit"))
+          PY
+          }
+
+          # Republish guard: a version that a registry already holds must have
+          # been built from exactly this commit. Otherwise --skip-duplicate (or
+          # npm's skip) would leave other code under the version while the
+          # remaining channels get this commit.
+          verify_published_commit() {
+            local version="$1" expected="$2" nuspec err commit rc=0
+            check_nuget "$version"
+            if [ "$nuget_state" = "present" ]; then
+              nuspec="$(mktemp)"
+              nuget_get "${nuget_base}/${version}/${nuget_id}.nuspec" "$nuspec"
+              if [ "$curl_rc" -ne 0 ] || [ "$http_status" != "200" ]; then
+                fail "nuget.org lists ${nuget_id} ${version} but its nuspec could not be read (curl exit ${curl_rc}, HTTP ${http_status}); cannot prove it was built from ${expected}."
+              fi
+              err="$(mktemp)"
+              commit="$(nuspec_commit "$nuspec" 2> "$err")" || rc=$?
+              if [ "$rc" -ne 0 ]; then
+                show "$err"
+                fail "The nuget.org nuspec of ${nuget_id} ${version} has no single repository commit; cannot prove it was built from ${expected}."
+              fi
+              commit="${commit,,}"
+              if [[ ! "$commit" =~ $sha_re ]]; then
+                fail "The nuget.org nuspec of ${nuget_id} ${version} does not record a full commit id; cannot prove it was built from ${expected}."
+              fi
+              if [ "$commit" != "$expected" ]; then
+                fail "nuget.org already has ${nuget_id} ${version} built from ${commit}, but ${tag_name} points at ${expected}. Refusing to publish different code under the same version."
+              fi
+              echo "nuget.org ${nuget_id} ${version} was built from ${expected}."
+            else
+              echo "${nuget_id} ${version} is not on nuget.org yet."
+            fi
+
+            check_npm "$version"
+            if [ "$npm_state" = "present" ]; then
+              err="$(mktemp)"
+              rc=0
+              commit="$(cd "$RUNNER_TEMP" && npm view "${npm_package}@${version}" gitHead 2> "$err")" || rc=$?
+              if [ "$rc" -ne 0 ]; then
+                show "$err"
+                fail "Could not read the gitHead of ${npm_package}@${version} (npm view exit ${rc}); cannot prove it was built from ${expected}."
+              fi
+              commit="${commit,,}"
+              if [[ ! "$commit" =~ $sha_re ]]; then
+                fail "${npm_package}@${version} on npm does not record a full source commit (gitHead); cannot prove it was built from ${expected}."
+              fi
+              if [ "$commit" != "$expected" ]; then
+                fail "npm already has ${npm_package}@${version} built from ${commit}, but ${tag_name} points at ${expected}. Refusing to publish different code under the same version."
+              fi
+              echo "npm ${npm_package}@${version} was built from ${expected}."
+            else
+              echo "${npm_package}@${version} is not on npm yet."
+            fi
+          }
+
+          # Sets npm_state to present or absent. Only E404 (or the empty answer
+          # older npm versions give for a missing version) counts as absent.
+          check_npm() {
+            local version="$1" out err rc=0
+            err="$(mktemp)"
+            out="$(cd "$RUNNER_TEMP" && npm view "${npm_package}@${version}" version 2> "$err")" || rc=$?
+
+            if [ "$rc" -eq 0 ]; then
+              if [ -z "$out" ]; then
+                npm_state=absent
+              elif [ "$out" = "$version" ]; then
+                npm_state=present
+              else
+                fail "Unexpected answer from npm view ${npm_package}@${version}; refusing to assume it is unpublished."
+              fi
+            elif grep -Eq '^npm (error|ERR!) code E404$' "$err"; then
+              npm_state=absent
+            else
+              show "$err"
+              fail "npm view ${npm_package}@${version} failed (exit ${rc}); refusing to assume it is unpublished."
+            fi
+          }
+
+          new_tag=false
+
+          if [ -n "${REQUESTED_TAG:-}" ]; then
+            # Tag mode: republish an existing tag that is already on master.
+            if [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]; then
+              fail "A tag can only be requested from a manual run."
+            fi
+            if [[ ! "$REQUESTED_TAG" =~ $tag_re ]]; then
+              fail "Input 'tag' must be an existing tag of the form vX.Y.Z (for example v1.2.1)."
+            fi
+            tag_name="$REQUESTED_TAG"
+            sha="$(git rev-parse -q --verify "refs/tags/${tag_name}^{commit}")" \
+              || fail "Tag ${tag_name} does not exist."
+            git rev-parse -q --verify 'refs/remotes/origin/master^{commit}' > /dev/null \
+              || fail "origin/master was not fetched; cannot check where ${tag_name} is."
+            git merge-base --is-ancestor "$sha" refs/remotes/origin/master \
+              || fail "Tag ${tag_name} (${sha}) is not on master; refusing to publish it."
+            version="${tag_name#v}"
+            echo "Republishing requested tag ${tag_name} at ${sha}."
+            verify_published_commit "$version" "$sha"
           else
-            base_version="${latest_tag#v}"
-            commit_range="${latest_tag}..HEAD"
+            # Compute mode: only from master, at the commit that triggered the run.
+            if [ "$GITHUB_REF" != "refs/heads/master" ]; then
+              fail "A new version can only be computed on refs/heads/master. To republish an existing tag, run the workflow with the 'tag' input."
+            fi
+            sha="$GITHUB_SHA"
+            if [[ ! "$sha" =~ $sha_re ]]; then
+              fail "GITHUB_SHA is not a commit id."
+            fi
+            head_sha="$(git rev-parse HEAD)"
+            if [ "$head_sha" != "$sha" ]; then
+              fail "Checked-out HEAD ${head_sha} is not GITHUB_SHA ${sha}."
+            fi
+
+            head_tags="$(release_tags --points-at "$sha")"
+            if [ -n "$head_tags" ]; then
+              # HEAD is already released: finish any channel that is still missing.
+              tag_name="${head_tags%%$'\n'*}"
+              version="${tag_name#v}"
+              echo "HEAD is already tagged ${tag_name}; republishing it."
+              verify_published_commit "$version" "$sha"
+            else
+              all_tags="$(release_tags)"
+              latest_tag="${all_tags%%$'\n'*}"
+              if [ -z "$latest_tag" ]; then
+                base_version="0.0.0"
+                commit_range="$sha"
+              else
+                base_version="${latest_tag#v}"
+                commit_range="${latest_tag}..${sha}"
+              fi
+
+              commit_count="$(git rev-list --count "$commit_range" --)"
+              if [ "$commit_count" -eq 0 ]; then
+                echo "No commits since ${latest_tag}; nothing to release."
+                emit release false
+                emit new_tag false
+                emit version "$base_version"
+                emit tag_name "$latest_tag"
+                emit sha "$sha"
+                exit 0
+              fi
+
+              IFS='.' read -r major minor patch <<< "$base_version"
+              commit_text="$(git log --format='%s%n%b' "$commit_range" --)"
+
+              bump="patch"
+              if grep -Eq '(^|[[:space:]])BREAKING CHANGE:|^[a-zA-Z]+(\([^)]+\))?!:' <<< "$commit_text"; then
+                bump="major"
+              elif grep -Eq '^feat(\([^)]+\))?:' <<< "$commit_text"; then
+                bump="minor"
+              fi
+
+              case "$bump" in
+                major)
+                  major=$((10#$major + 1))
+                  minor=0
+                  patch=0
+                  ;;
+                minor)
+                  major=$((10#$major))
+                  minor=$((10#$minor + 1))
+                  patch=0
+                  ;;
+                patch)
+                  major=$((10#$major))
+                  minor=$((10#$minor))
+                  patch=$((10#$patch + 1))
+                  ;;
+              esac
+
+              version="${major}.${minor}.${patch}"
+              tag_name="v${version}"
+              echo "${commit_count} commit(s) since ${latest_tag:-the beginning}: ${bump} bump to ${version}."
+
+              if git rev-parse -q --verify "refs/tags/${tag_name}" > /dev/null; then
+                fail "Tag ${tag_name} already exists but does not point at ${sha}; refusing to reuse the version."
+              fi
+
+              # Guard: a version that is already on a registry without a tag was
+              # published by an earlier failed run; never ship different code under it.
+              check_nuget "$version"
+              if [ "$nuget_state" = "present" ]; then
+                fail "GitSweep.Cli ${version} is already on nuget.org but tag ${tag_name} does not exist. Tag the commit that was published and run the workflow with tag=${tag_name}."
+              fi
+              check_npm "$version"
+              if [ "$npm_state" = "present" ]; then
+                fail "${npm_package}@${version} is already on npm but tag ${tag_name} does not exist. Tag the commit that was published and run the workflow with tag=${tag_name}."
+              fi
+              echo "Version ${version} is on neither nuget.org nor npm."
+              new_tag=true
+            fi
           fi
 
-          commit_count="$(git rev-list --count "${commit_range}")"
-          if [ "${commit_count}" -eq 0 ]; then
-            echo "release_created=false" >> "${GITHUB_OUTPUT}"
-            echo "tag_name=${latest_tag}" >> "${GITHUB_OUTPUT}"
-            echo "version=${base_version}" >> "${GITHUB_OUTPUT}"
-            exit 0
-          fi
+          emit release true
+          emit version "$version"
+          emit tag_name "$tag_name"
+          emit sha "$sha"
+          emit new_tag "$new_tag"
+          printf 'Release %s (%s) at %s, new tag: %s\n' "$version" "$tag_name" "$sha" "$new_tag" >> "$GITHUB_STEP_SUMMARY"
 
-          IFS='.' read -r major minor patch <<< "${base_version}"
-          commit_text="$(git log --format='%s%n%b' "${commit_range}")"
-
-          bump="patch"
-          if echo "${commit_text}" | grep -Eq '(^|[[:space:]])BREAKING CHANGE:|^[a-zA-Z]+(\([^)]+\))?!:'; then
-            bump="major"
-          elif echo "${commit_text}" | grep -Eq '^feat(\([^)]+\))?:'; then
-            bump="minor"
-          fi
-
-          case "${bump}" in
-            major)
-              major=$((major + 1))
-              minor=0
-              patch=0
-              ;;
-            minor)
-              minor=$((minor + 1))
-              patch=0
-              ;;
-            patch)
-              patch=$((patch + 1))
-              ;;
-          esac
-
-          version="${major}.${minor}.${patch}"
-          tag_name="v${version}"
-
-          if git rev-parse -q --verify "refs/tags/${tag_name}" >/dev/null 2>&1; then
-            echo "release_created=false" >> "${GITHUB_OUTPUT}"
-            echo "tag_name=${tag_name}" >> "${GITHUB_OUTPUT}"
-            echo "version=${version}" >> "${GITHUB_OUTPUT}"
-            exit 0
-          fi
-
-          echo "release_created=true" >> "${GITHUB_OUTPUT}"
-          echo "tag_name=${tag_name}" >> "${GITHUB_OUTPUT}"
-          echo "version=${version}" >> "${GITHUB_OUTPUT}"
-
-  publish-nuget:
-    needs: prepare-release
-    if: ${{ needs.prepare-release.outputs.release_created == 'true' }}
+  build:
+    name: Build, test and pack
+    needs: version
+    if: needs.version.outputs.release == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      SHA: ${{ needs.version.outputs.sha }}
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Checkout release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ needs.version.outputs.sha }}
           fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify checkout
+        run: |
+          set -euo pipefail
+          if [[ ! "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || [[ ! "$SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Refusing to build from invalid version outputs."
+            exit 1
+          fi
+          head_sha="$(git rev-parse HEAD)"
+          if [ "$head_sha" != "$SHA" ]; then
+            echo "::error::Checked-out HEAD ${head_sha} is not the release commit ${SHA}."
+            exit 1
+          fi
 
       - name: Setup .NET
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
           dotnet-version: 10.0.x
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          package-manager-cache: false
 
       - name: Restore
         run: dotnet restore
 
+      - name: Build
+        run: dotnet build --configuration Release --no-restore -p:Version="$VERSION"
+
       - name: Test
-        run: dotnet test --configuration Release --no-restore --verbosity normal
+        run: dotnet test --configuration Release --no-build --verbosity normal
 
       - name: Pack NuGet tool
-        run: dotnet pack GitSweep.Cli/GitSweep.Cli.csproj --configuration Release --no-restore --output artifacts -p:Version=${{ needs.prepare-release.outputs.version }} -p:PackageVersion=${{ needs.prepare-release.outputs.version }}
+        run: |
+          set -euo pipefail
+          dotnet pack GitSweep.Cli/GitSweep.Cli.csproj --configuration Release --no-build --output artifacts \
+            -p:Version="$VERSION" -p:PackageVersion="$VERSION"
 
-      - name: Publish to nuget.org
-        shell: bash
+          shopt -s nullglob
+          packages=(artifacts/*.nupkg)
+          expected="artifacts/GitSweep.Cli.${VERSION}.nupkg"
+          if [ "${#packages[@]}" -ne 1 ] || [ "${packages[0]}" != "$expected" ]; then
+            echo "::error::Expected exactly ${expected} in artifacts/."
+            exit 1
+          fi
+
+      - name: Publish .NET payload for npm
+        run: |
+          set -euo pipefail
+          dotnet publish GitSweep.Cli/GitSweep.Cli.csproj --configuration Release --no-restore --output npm-package/tools/net10.0 \
+            -p:Version="$VERSION" -p:PackageVersion="$VERSION"
+
+          if [ ! -f npm-package/tools/net10.0/gitsweep-cli.dll ]; then
+            echo "::error::dotnet publish did not produce npm-package/tools/net10.0/gitsweep-cli.dll."
+            exit 1
+          fi
+
+      - name: Prepare npm package metadata
+        run: |
+          set -euo pipefail
+          cp LICENSE.txt npm-package/LICENSE.txt
+          cp -R assets npm-package/assets
+          npm version "$VERSION" \
+            --prefix npm-package \
+            --no-git-tag-version \
+            --allow-same-version \
+            --ignore-scripts
+          # npm's standard source-commit field; the version job compares it on
+          # republish, like the repository commit NuGet records in the nuspec.
+          npm pkg set "gitHead=${SHA}" --prefix npm-package
+
+          package_version="$(node -p 'require("./npm-package/package.json").version')"
+          package_commit="$(node -p 'require("./npm-package/package.json").gitHead')"
+          if [ "$package_version" != "$VERSION" ] || [ "$package_commit" != "$SHA" ]; then
+            echo "::error::npm-package/package.json does not carry version ${VERSION} and gitHead ${SHA}."
+            exit 1
+          fi
+
+      - name: Test npm launcher
+        working-directory: npm-package
+        run: node --test
+
+      - name: Pack npm package
+        working-directory: npm-package
+        run: |
+          set -euo pipefail
+          mkdir -p ../npm-artifacts
+          npm pack --ignore-scripts --pack-destination ../npm-artifacts
+
+          shopt -s nullglob
+          tarballs=(../npm-artifacts/*.tgz)
+          expected="../npm-artifacts/stescobedo9205-gitsweep-cli-${VERSION}.tgz"
+          if [ "${#tarballs[@]}" -ne 1 ] || [ "${tarballs[0]}" != "$expected" ]; then
+            echo "::error::Expected exactly ${expected#../} after npm pack."
+            exit 1
+          fi
+
+          tar -tzf "$expected" > "$RUNNER_TEMP/npm-files.txt"
+          if ! grep -qx 'package/tools/net10.0/gitsweep-cli.dll' "$RUNNER_TEMP/npm-files.txt"; then
+            echo "::error::The npm tarball does not contain tools/net10.0/gitsweep-cli.dll."
+            exit 1
+          fi
+
+          tar -xzOf "$expected" package/package.json > "$RUNNER_TEMP/packed-package.json"
+          packed="$(node -p 'const m = require(process.argv[1]); m.version + " " + m.gitHead' "$RUNNER_TEMP/packed-package.json")"
+          if [ "$packed" != "${VERSION} ${SHA}" ]; then
+            echo "::error::The npm tarball manifest does not carry version ${VERSION} and gitHead ${SHA}."
+            exit 1
+          fi
+
+      # overwrite: a "Re-run all jobs" attempt replaces the artifact of the
+      # earlier attempt; nothing else in a run uploads these names.
+      - name: Upload NuGet package
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nupkg
+          path: artifacts/*.nupkg
+          if-no-files-found: error
+          overwrite: true
+
+      - name: Upload npm package
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: npm-tgz
+          path: npm-artifacts/*.tgz
+          if-no-files-found: error
+          overwrite: true
+
+  tag:
+    name: Create tag
+    needs:
+      - version
+      - build
+    if: needs.version.outputs.new_tag == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: release
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.version.outputs.tag_name }}
+      SHA: ${{ needs.version.outputs.sha }}
+
+    steps:
+      - name: Create tag at the release commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          shopt -s inherit_errexit
+
+          if [[ ! "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || [[ ! "$SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Refusing to create a tag from invalid version outputs."
+            exit 1
+          fi
+
+          create_err="$(mktemp)"
+          if created_sha="$(gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f "ref=refs/tags/${TAG}" -f "sha=${SHA}" --jq '.object.sha' 2> "$create_err")"; then
+            if [ "$created_sha" != "$SHA" ]; then
+              echo "::error::GitHub created ${TAG} at ${created_sha}, expected ${SHA}."
+              exit 1
+            fi
+            echo "Created tag ${TAG} at ${SHA}."
+            exit 0
+          fi
+
+          # Creation failed: succeed only if the tag already exists at this commit.
+          if ! existing="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" --jq '.object.type + " " + .object.sha' 2> /dev/null)"; then
+            sed -n -e '1,20s/^/  | /p' -- "$create_err"
+            echo "::error::Could not create tag ${TAG}, and it does not exist either."
+            exit 1
+          fi
+          read -r object_type object_sha <<< "$existing"
+          if [ "$object_type" = "tag" ] && [[ "$object_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            existing="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${object_sha}" --jq '.object.type + " " + .object.sha')"
+            read -r object_type object_sha <<< "$existing"
+          fi
+          if [ "$object_type" != "commit" ] || [ "$object_sha" != "$SHA" ]; then
+            echo "::error::Tag ${TAG} already exists but does not point at commit ${SHA}; refusing to publish under it."
+            exit 1
+          fi
+          echo "Tag ${TAG} already exists at ${SHA}."
+
+  publish-nuget:
+    name: Publish to nuget.org
+    needs:
+      - version
+      - build
+      - tag
+    if: >-
+      ${{ !cancelled()
+      && needs.version.result == 'success'
+      && needs.version.outputs.release == 'true'
+      && needs.build.result == 'success'
+      && (needs.tag.result == 'success'
+      || (needs.tag.result == 'skipped' && needs.version.outputs.new_tag != 'true')) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release
+    # The artifact download authenticates with ACTIONS_RUNTIME_TOKEN, not GITHUB_TOKEN.
+    permissions: {}
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+
+    steps:
+      - name: Download NuGet package
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: nupkg
+          path: dist
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Push to nuget.org
         env:
           NUGET_API_KEY: ${{ secrets.NUGET_ORG_NEW_API_KEY }}
         run: |
@@ -121,126 +593,254 @@ jobs:
             echo "::error::NUGET_ORG_NEW_API_KEY is not configured."
             exit 1
           fi
-
-          for package in artifacts/*.nupkg; do
-            dotnet nuget push "$package" \
-              --api-key "${NUGET_API_KEY}" \
-              --source "https://api.nuget.org/v3/index.json" \
-              --skip-duplicate
-          done
-
-  publish-npm:
-    needs: prepare-release
-    if: ${{ needs.prepare-release.outputs.release_created == 'true' }}
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Setup .NET
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: 10.0.x
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          registry-url: https://registry.npmjs.org
-          scope: '@stescobedo9205'
-
-      - name: Restore
-        run: dotnet restore
-
-      - name: Test
-        run: dotnet test --configuration Release --no-restore --verbosity normal
-
-      - name: Publish .NET payload for npm
-        run: dotnet publish GitSweep.Cli/GitSweep.Cli.csproj --configuration Release --no-restore --output npm-package/tools/net10.0 -p:Version=${{ needs.prepare-release.outputs.version }} -p:PackageVersion=${{ needs.prepare-release.outputs.version }}
-
-      - name: Prepare npm package metadata
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cp LICENSE.txt npm-package/LICENSE.txt
-          cp -R assets npm-package/assets
-          npm version "${{ needs.prepare-release.outputs.version }}" \
-            --prefix npm-package \
-            --no-git-tag-version \
-            --allow-same-version
-
-      - name: Pack npm package
-        working-directory: npm-package
-        run: |
-          mkdir -p ../npm-artifacts
-          npm pack --pack-destination ../npm-artifacts
-
-      - name: Publish to npm
-        shell: bash
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_ORG }}
-        run: |
-          set -euo pipefail
-
-          if [ -z "${NODE_AUTH_TOKEN}" ]; then
-            echo "::error::NPM_ORG is not configured."
+          if [[ ! "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Refusing to publish an invalid version output."
             exit 1
           fi
 
-          npm publish ./npm-artifacts/*.tgz --access public --registry https://registry.npmjs.org
-
-  create-github-release:
-    needs:
-      - prepare-release
-      - publish-nuget
-      - publish-npm
-    if: ${{ needs.prepare-release.outputs.release_created == 'true' }}
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Setup .NET
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: 10.0.x
-
-      - name: Pack release artifact
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          mkdir -p artifacts
-          dotnet pack GitSweep.Cli/GitSweep.Cli.csproj \
-            --configuration Release \
-            --output artifacts \
-            -p:Version=${{ needs.prepare-release.outputs.version }} \
-            -p:PackageVersion=${{ needs.prepare-release.outputs.version }}
-
-      - name: Create GitHub release
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG_NAME: ${{ needs.prepare-release.outputs.tag_name }}
-          VERSION: ${{ needs.prepare-release.outputs.version }}
-        run: |
-          set -euo pipefail
-
-          previous_tag="$(git tag --list 'v[0-9]*' --sort=-v:refname | grep -v "^${TAG_NAME}$" | head -n 1 || true)"
-          if [ -z "${previous_tag}" ]; then
-            git log --no-merges --format='- %s (%h)' HEAD > release-notes.md
-          else
-            git log --no-merges --format='- %s (%h)' "${previous_tag}..HEAD" > release-notes.md
+          package="dist/GitSweep.Cli.${VERSION}.nupkg"
+          if [ ! -f "$package" ]; then
+            echo "::error::${package} is missing from the build artifact."
+            exit 1
           fi
 
-          gh release create "${TAG_NAME}" artifacts/*.nupkg \
-            --target "${GITHUB_SHA}" \
-            --title "GitSweep ${VERSION}" \
-            --notes-file release-notes.md
+          dotnet nuget push "$package" \
+            --api-key "${NUGET_API_KEY}" \
+            --source "https://api.nuget.org/v3/index.json" \
+            --skip-duplicate
+
+  publish-npm:
+    name: Publish to npm
+    needs:
+      - version
+      - build
+      - tag
+    if: >-
+      ${{ !cancelled()
+      && needs.version.result == 'success'
+      && needs.version.outputs.release == 'true'
+      && needs.build.result == 'success'
+      && (needs.tag.result == 'success'
+      || (needs.tag.result == 'skipped' && needs.version.outputs.new_tag != 'true')) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release
+    permissions:
+      id-token: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+
+    steps:
+      - name: Download npm package
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: npm-tgz
+          path: dist
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          scope: "@stescobedo9205"
+          package-manager-cache: false
+
+      - name: Check npm supports trusted publishing
+        run: |
+          set -euo pipefail
+          npm_version="$(npm --version)"
+          if [[ ! "$npm_version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+            echo "::error::Could not parse the npm version."
+            exit 1
+          fi
+          major=$((10#${BASH_REMATCH[1]}))
+          minor=$((10#${BASH_REMATCH[2]}))
+          patch=$((10#${BASH_REMATCH[3]}))
+          if (( major < 11 || (major == 11 && (minor < 5 || (minor == 5 && patch < 1))) )); then
+            echo "::error::npm ${major}.${minor}.${patch} is too old for trusted publishing (OIDC); npm >= 11.5.1 is required. Use a Node.js release that bundles it."
+            exit 1
+          fi
+          echo "npm ${npm_version} supports trusted publishing."
+
+      - name: Publish to npm
+        env:
+          # May be empty: npm then authenticates with the trusted publisher (OIDC).
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_ORG }}
+        run: |
+          set -euo pipefail
+          shopt -s inherit_errexit
+
+          readonly npm_package='@stescobedo9205/gitsweep-cli'
+          if [[ ! "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Refusing to publish an invalid version output."
+            exit 1
+          fi
+          tarball="./dist/stescobedo9205-gitsweep-cli-${VERSION}.tgz"
+          if [ ! -f "$tarball" ]; then
+            echo "::error::${tarball#./} is missing from the build artifact."
+            exit 1
+          fi
+
+          # Idempotency: skip when this version is already on npm. Only E404 (or
+          # the empty answer of older npm versions) counts as "not published".
+          err="$(mktemp)"
+          rc=0
+          out="$(npm view "${npm_package}@${VERSION}" version 2> "$err")" || rc=$?
+          state=unknown
+          if [ "$rc" -eq 0 ]; then
+            if [ "$out" = "$VERSION" ]; then
+              state=present
+            elif [ -z "$out" ]; then
+              state=absent
+            fi
+          elif grep -Eq '^npm (error|ERR!) code E404$' "$err"; then
+            state=absent
+          fi
+          case "$state" in
+            present)
+              echo "${npm_package}@${VERSION} is already on npm; skipping."
+              exit 0
+              ;;
+            absent)
+              ;;
+            *)
+              sed -n -e '1,40s/^/  | /p' -- "$err"
+              echo "::error::Could not tell whether ${npm_package}@${VERSION} is already on npm (npm view exit ${rc}); refusing to publish."
+              exit 1
+              ;;
+          esac
+
+          if [ -z "${NODE_AUTH_TOKEN}" ]; then
+            echo "NPM_ORG is empty: authenticating with the npm trusted publisher (OIDC)."
+          else
+            echo "NPM_ORG is set: npm tries the trusted publisher (OIDC) first and falls back to that token."
+          fi
+
+          if ! npm publish "$tarball" --access public --provenance; then
+            echo "::error::npm publish failed. The first publish of ${npm_package} needs a bootstrap token in the NPM_ORG secret; later publishes need a trusted publisher on npmjs.com (user stescobedo92, repository GitSweep, workflow release.yml, environment release)."
+            exit 1
+          fi
+          echo "Published ${npm_package}@${VERSION}."
+
+  github-release:
+    name: GitHub release
+    needs:
+      - version
+      - build
+      - publish-nuget
+    if: >-
+      ${{ !cancelled()
+      && needs.version.outputs.release == 'true'
+      && needs.build.result == 'success'
+      && needs.publish-nuget.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: release
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      TAG: ${{ needs.version.outputs.tag_name }}
+      SHA: ${{ needs.version.outputs.sha }}
+
+    steps:
+      - name: Checkout release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.version.outputs.sha }}
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Download NuGet package
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: nupkg
+          path: dist
+
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          shopt -s inherit_errexit
+
+          readonly tag_re='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          if [[ ! "$TAG" =~ $tag_re ]] || [ "$TAG" != "v${VERSION}" ] || [[ ! "$SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Refusing to release from invalid version outputs."
+            exit 1
+          fi
+
+          # The tag must still name the commit that was built and published.
+          if ! tag_commit="$(git rev-parse -q --verify "refs/tags/${TAG}^{commit}")"; then
+            echo "::error::Tag ${TAG} is not in the checkout."
+            exit 1
+          fi
+          if [ "$tag_commit" != "$SHA" ]; then
+            echo "::error::Tag ${TAG} now points at ${tag_commit}, not at the released commit ${SHA}; refusing to attach the release to it."
+            exit 1
+          fi
+
+          asset="GitSweep.Cli.${VERSION}.nupkg"
+          package="dist/${asset}"
+          if [ ! -f "$package" ]; then
+            echo "::error::${package} is missing from the build artifact."
+            exit 1
+          fi
+
+          # previous_tag: the highest vX.Y.Z tag below this version.
+          all_tags="$(git tag --list 'v[0-9]*')"
+          sorted="$(printf '%s\n%s\n' "$all_tags" "$TAG" | { grep -E "$tag_re" || [ "$?" -eq 1 ]; } | sort -uV)"
+          previous_tag=""
+          highest_tag=""
+          seen_self=false
+          while IFS= read -r tag; do
+            if [ "$tag" = "$TAG" ]; then
+              seen_self=true
+            elif [ "$seen_self" = false ]; then
+              previous_tag="$tag"
+            fi
+            highest_tag="$tag"
+          done <<< "$sorted"
+
+          notes="$RUNNER_TEMP/release-notes.md"
+          if [ -z "$previous_tag" ]; then
+            git log --no-merges --format='- %s (%h)' "$SHA" -- > "$notes"
+          else
+            git log --no-merges --format='- %s (%h)' "${previous_tag}..${SHA}" -- > "$notes"
+          fi
+          if [ ! -s "$notes" ]; then
+            echo "- No changes listed." > "$notes"
+          fi
+
+          # Only the highest version is marked "Latest", so republishing an
+          # older tag never takes that label from a newer release.
+          latest=false
+          if [ "$highest_tag" = "$TAG" ]; then
+            latest=true
+          fi
+
+          err="$(mktemp)"
+          assets="$(mktemp)"
+          if gh release view "$TAG" --json assets --jq '.assets[].name' > "$assets" 2> "$err"; then
+            # An asset that is already attached stays as it is: a later
+            # attempt never replaces the bytes of an earlier one.
+            if grep -Fxq -- "$asset" "$assets"; then
+              echo "Release ${TAG} already has ${asset}; leaving it unchanged."
+            else
+              gh release upload "$TAG" "$package"
+              echo "Release ${TAG} exists; attached ${asset}."
+            fi
+          elif grep -qx 'release not found' "$err"; then
+            gh release create "$TAG" "$package" \
+              --verify-tag \
+              --title "GitSweep ${VERSION}" \
+              --notes-file "$notes" \
+              --latest="$latest"
+            echo "Created release ${TAG}."
+          else
+            sed -n -e '1,40s/^/  | /p' -- "$err"
+            echo "::error::Could not look up release ${TAG}."
+            exit 1
+          fi

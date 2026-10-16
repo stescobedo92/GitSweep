@@ -17,10 +17,12 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Setup .NET
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
           dotnet-version: 10.0.x
 
@@ -34,10 +36,10 @@ jobs:
         run: dotnet test --configuration Release --no-build --verbosity normal
 
       - name: Pack tool
-        run: dotnet pack GitSweep.Cli/GitSweep.Cli.csproj --configuration Release --no-build --output artifacts -p:Version=0.0.0-ci.${{ github.run_number }} -p:PackageVersion=0.0.0-ci.${{ github.run_number }}
+        run: dotnet pack GitSweep.Cli/GitSweep.Cli.csproj --configuration Release --no-build --output artifacts "-p:Version=0.0.0-ci.${GITHUB_RUN_NUMBER}" "-p:PackageVersion=0.0.0-ci.${GITHUB_RUN_NUMBER}"
 
       - name: Upload package artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: gitsweep-cli-nupkg
           path: artifacts/*.nupkg
